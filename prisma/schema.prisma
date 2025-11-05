@@ -1,0 +1,232 @@
+// This is your Prisma schema file for Appointment Service
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+// ==============================
+// Enums
+// ==============================
+
+// Estados de una cita
+enum AppointmentStatus {
+  SCHEDULED // Programada
+  CONFIRMED // Confirmada por paciente
+  IN_PROGRESS // En consulta
+  COMPLETED // Completada
+  CANCELLED // Cancelada
+  RESCHEDULED // Reagendada
+  NO_SHOW // Paciente no se presentó
+}
+
+// Estados de un ticket en la cola
+enum QueueStatus {
+  WAITING
+  CALLED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+// Tipos de notificación
+enum NotificationType {
+  APPOINTMENT_CREATED
+  APPOINTMENT_CONFIRMED
+  APPOINTMENT_REMINDER
+  APPOINTMENT_CANCELLED
+  APPOINTMENT_RESCHEDULED
+  QUEUE_CALLED
+  QUEUE_POSITION_UPDATE
+}
+
+// Estados de notificación
+enum NotificationStatus {
+  PENDING
+  SENT
+  DELIVERED
+  READ
+  FAILED
+}
+
+// ==============================
+// Models
+// ==============================
+
+// Citas médicas
+model Appointment {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  // Referencias externas (otros microservicios)
+  patientId   String  @db.ObjectId
+  doctorId    String  @db.ObjectId
+  specialtyId String? @db.ObjectId
+
+  // Datos de la cita
+  appointmentDate DateTime
+  duration        Int      @default(30) // minutos
+  reason          String?
+  notes           String?
+
+  // Estado
+  status AppointmentStatus @default(SCHEDULED)
+
+  // Metadata de estado
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  cancelledAt        DateTime?
+  completedAt        DateTime?
+  confirmedAt        DateTime?
+  cancellationReason String?
+  cancelledBy        String?   @db.ObjectId
+
+  // Reagendamiento
+  previousAppointmentId String? @db.ObjectId
+  isRescheduled         Boolean @default(false)
+
+  // Relaciones
+  history     AppointmentHistory[]
+  queueTicket QueueTicket?
+
+  @@index([patientId])
+  @@index([doctorId])
+  @@index([appointmentDate])
+  @@index([status])
+  @@map("appointments")
+}
+
+// Historial/auditoría de cambios de cita
+model AppointmentHistory {
+  id            String      @id @default(auto()) @map("_id") @db.ObjectId
+  appointmentId String      @db.ObjectId
+  appointment   Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+
+  action         String // CREATED, UPDATED, CANCELLED, RESCHEDULED, STATUS_CHANGED
+  previousStatus AppointmentStatus?
+  newStatus      AppointmentStatus?
+
+  previousData  Json?
+  newData       Json?
+  changedFields String[]
+
+  changedBy     String? @db.ObjectId
+  changedByRole String? // PATIENT, DOCTOR, ADMIN, SYSTEM
+
+  createdAt DateTime @default(now())
+  ipAddress String?
+  userAgent String?
+
+  @@index([appointmentId])
+  @@index([createdAt])
+  @@map("appointment_history")
+}
+
+// Horarios de disponibilidad de médicos
+model Schedule {
+  id       String @id @default(auto()) @map("_id") @db.ObjectId
+  doctorId String @db.ObjectId
+
+  dayOfWeek    Int // 0=Dom, 1=Lun, ... 6=Sáb
+  startTime    String // "HH:mm"
+  endTime      String // "HH:mm"
+  slotDuration Int     @default(30)
+  isActive     Boolean @default(true)
+
+  validFrom  DateTime?
+  validUntil DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  blockedSlots BlockedSlot[]
+
+  @@index([doctorId])
+  @@index([dayOfWeek])
+  @@map("schedules")
+}
+
+// Bloqueos manuales de horario
+model BlockedSlot {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  scheduleId String   @db.ObjectId
+  schedule   Schedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+
+  blockedDate DateTime
+  startTime   String // "HH:mm"
+  endTime     String // "HH:mm"
+  reason      String?
+
+  createdAt DateTime @default(now())
+  createdBy String?  @db.ObjectId
+
+  @@index([scheduleId])
+  @@index([blockedDate])
+  @@map("blocked_slots")
+}
+
+// Tickets para cola de espera
+model QueueTicket {
+  id           String @id @default(auto()) @map("_id") @db.ObjectId
+  ticketNumber Int
+
+  patientId String @db.ObjectId
+  doctorId  String @db.ObjectId
+
+  appointmentId String?      @unique @db.ObjectId
+  appointment   Appointment? @relation(fields: [appointmentId], references: [id])
+
+  status QueueStatus @default(WAITING)
+
+  queueDate   DateTime  @default(now())
+  calledAt    DateTime?
+  startedAt   DateTime?
+  completedAt DateTime?
+  cancelledAt DateTime?
+
+  estimatedWaitTime Int?
+  position          Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([doctorId, status, queueDate])
+  @@index([patientId])
+  @@index([ticketNumber])
+  @@map("queue_tickets")
+}
+
+// Registro de notificaciones
+model NotificationLog {
+  id   String           @id @default(auto()) @map("_id") @db.ObjectId
+  type NotificationType
+
+  appointmentId String? @db.ObjectId
+  recipientId   String  @db.ObjectId
+
+  title   String
+  message String
+  channel String // EMAIL, SMS, PUSH, IN_APP
+
+  status      NotificationStatus @default(PENDING)
+  sentAt      DateTime?
+  deliveredAt DateTime?
+  readAt      DateTime?
+
+  errorMessage String?
+  retryCount   Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([recipientId])
+  @@index([appointmentId])
+  @@index([status])
+  @@map("notification_logs")
+}

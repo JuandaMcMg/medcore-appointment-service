@@ -1,0 +1,75 @@
+// src/index.js - Punto de entrada del microservicio
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+
+const app = express();
+const PORT = process.env.PORT || 3007;
+
+// ============================================
+// MIDDLEWARES
+// ============================================
+app.use(helmet());
+app.use(cors());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// ============================================
+// RUTAS
+// ============================================
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'OK',
+    service: 'medcore-appointment-service',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Ruta raíz
+app.get('/', (req, res) => {
+  res.json({
+    message: 'MedCore Appointment Service API',
+    version: '1.0.0',
+    status: 'Ready for implementation'
+  });
+});
+
+// ============================================
+// ERROR HANDLERS
+// ============================================
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    message: 'Endpoint no encontrado',
+    service: 'medcore-appointment-service'
+  });
+});
+
+// Error handler global
+app.use((err, req, res, next) => {
+  console.error('Error:', err);
+  res.status(err.statusCode || 500).json({
+    message: err.message || 'Error interno del servidor',
+    service: 'medcore-appointment-service'
+  });
+});
+
+// ============================================
+// START SERVER
+// ============================================
+
+app.listen(PORT, () => {
+  console.log(`
+  ╔═══════════════════════════════════════════════════╗
+  ║   MedCore Appointment Service                     ║
+  ║   Port: ${PORT}                                    ║
+  ║   Status: ✓ Running                               ║
+  ╚═══════════════════════════════════════════════════╝
+  `);
+});
+
+module.exports = app;
