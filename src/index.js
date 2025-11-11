@@ -4,9 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const { connectDatabase } = require('./database/database');
-const scheduleRoutes = require('./routes/scheduleRoutes');
 const apiV1 = require('./routes/routes');
-// Nota: appointmentRoutes se monta vía apiV1; aquí solo montamos schedules legacy
 
 const app = express();
 const PORT = process.env.PORT || 3007;
@@ -22,7 +20,6 @@ app.use(express.urlencoded({ extended: true }));
 // ============================================
 // RUTAS
 // ============================================
-app.use('/api', scheduleRoutes);
 
 // Health check
 app.get('/health', (req, res) => {
