@@ -31,6 +31,7 @@ async function disconnectDatabase() {
 
 process.on('SIGINT', async () => { await disconnectDatabase(); process.exit(0); });
 process.on('SIGTERM', async () => { await disconnectDatabase(); process.exit(0); });
-process.on('beforeExit', async () => { await disconnectDatabase(); });
+// Evitamos desconectar en 'beforeExit' para no cerrar la BD mientras el server sigue vivo (Express mantiene el loop activo)
+// process.on('beforeExit', async () => { await disconnectDatabase(); });
 
 module.exports = { prisma, connectDatabase, disconnectDatabase };

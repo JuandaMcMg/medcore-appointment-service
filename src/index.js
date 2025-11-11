@@ -5,7 +5,8 @@ const cors = require('cors');
 const helmet = require('helmet');
 const { connectDatabase } = require('./database/database');
 const scheduleRoutes = require('./routes/scheduleRoutes');
-const appointmentRoutes = require('./routes/appointmentRoutes');
+const apiV1 = require('./routes/routes');
+// Nota: appointmentRoutes se monta vía apiV1; aquí solo montamos schedules legacy
 
 const app = express();
 const PORT = process.env.PORT || 3007;
@@ -22,7 +23,6 @@ app.use(express.urlencoded({ extended: true }));
 // RUTAS
 // ============================================
 app.use('/api', scheduleRoutes);
-app.use('/api', appointmentRoutes);
 
 // Health check
 app.get('/health', (req, res) => {
@@ -41,6 +41,9 @@ app.get('/', (req, res) => {
     status: 'Ready for implementation'
   });
 });
+
+// Rutas v1
+app.use('/api/v1', apiV1);
 
 // ============================================
 // ERROR HANDLERS
@@ -69,7 +72,7 @@ app.use((err, req, res, next) => {
 
 (async () => {
   await connectDatabase();
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, () => {
     console.log(`
     ╔═══════════════════════════════════════════════════╗
     ║   MedCore Appointment Service                     ║
@@ -77,6 +80,9 @@ app.use((err, req, res, next) => {
     ║   Status: ✓ Running                               ║
     ╚═══════════════════════════════════════════════════╝
     `);
+  });
+  server.on('error', (err) => {
+    console.error('HTTP server error:', err);
   });
 })();
 

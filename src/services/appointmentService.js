@@ -1,113 +1,348 @@
 const { prisma } = require('../database/database');
+const axios = require('axios');
+const { parseISO, startOfDay, endOfDay, isValid } = require('date-fns');
 const { parseTimeToMinutes } = require('../utils/time');
 
-const OBJECT_ID_REGEX = /^[0-9a-fA-F]{24}$/;
-function validateObjectId(id, fieldName = 'id') {
-  if (!OBJECT_ID_REGEX.test(id)) {
-    const err = new Error(`Valor inválido para ${fieldName}`);
-    err.statusCode = 400; throw err;
+const USER_URL = process.env.USER_SERVICE_URL || 'http://localhost:3003';
+const ACTIVE_STATES = ['SCHEDULED', 'CONFIRMED', 'IN_PROGRESS', 'RESCHEDULED'];
+
+function parsePagination(page, limit) {
+  const p = Math.max(1, parseInt(page || '1', 10));
+  const l = Math.min(100, Math.max(1, parseInt(limit || '20', 10)));
+  return { page: p, limit: l, skip: (p - 1) * l, take: l };
+}
+
+const ES_TO_ENUM = {
+  PROGRAMADA: 'SCHEDULED',
+  CANCELADA: 'CANCELLED',
+  COMPLETADA: 'COMPLETED',
+  REAGENDADA: 'RESCHEDULED'
+};
+
+const VALID_TRANSITIONS = {
+  SCHEDULED: ['CANCELLED', 'COMPLETED', 'RESCHEDULED', 'CONFIRMED', 'IN_PROGRESS'],
+  CONFIRMED: ['CANCELLED', 'COMPLETED', 'RESCHEDULED', 'IN_PROGRESS'],
+  IN_PROGRESS: ['COMPLETED', 'CANCELLED'],
+  RESCHEDULED: ['CANCELLED', 'COMPLETED', 'CONFIRMED', 'IN_PROGRESS'],
+  COMPLETED: [],
+  CANCELLED: []
+};
+
+function toDayRange(dateFrom, dateTo) {
+  let gte, lte;
+  if (dateFrom) {
+    const d = parseISO(dateFrom.length > 10 ? dateFrom : `${dateFrom}T00:00:00.000Z`);
+    if (isValid(d)) gte = startOfDay(d);
   }
+  if (dateTo) {
+    const d = parseISO(dateTo.length > 10 ? dateTo : `${dateTo}T00:00:00.000Z`);
+    if (isValid(d)) lte = endOfDay(d);
+  }
+  return (gte || lte) ? { gte, lte } : undefined;
+}
+
+const appErr = (message, status, code, extra = {}) => {
+  const e = new Error(message);
+  e.status = status;
+  e.code = code;
+  e.extra = extra;
+  return e;
+};
+
+function mapStatus(input) {
+  if (!input) return undefined;
+  const u = String(input).trim().toUpperCase();
+  return ES_TO_ENUM[u] || u;
+}
+
+function parseDate(d) {
+  const dt = new Date(d);
+  if (Number.isNaN(dt.getTime())) throw appErr('Fecha inválida', 400, 'INVALID_DATE');
+  return dt;
+}
+
+function ensureTransition(prev, next) {
+  const allowed = VALID_TRANSITIONS[prev] || [];
+  if (!allowed.includes(next)) {
+    throw appErr(`Transición inválida: ${prev} → ${next}`, 400, 'INVALID_TRANSITION', { from: prev, to: next });
+  }
+}
+
+async function resolvePatientIdsByName(patientName, authHeader) {
+  if (!patientName) return [];
+  try {
+    const { data } = await axios.get(`${USER_URL}/users`, {
+      params: { q: patientName, role: 'PACIENTE', limit: 100 },
+      headers: authHeader ? { Authorization: authHeader } : {}
+    });
+    const users = data?.users || [];
+    return users.map(u => u.id);
+  } catch (e) {
+    console.warn('[resolvePatientIdsByName] fallo, ignorando filtro', e.message);
+    return [];
+  }
+}
+
+function buildOrder(orderBy, order) {
+  const field = ['appointmentDate','createdAt','status','doctorId','patientId'].includes(orderBy) ? orderBy : 'appointmentDate';
+  const dir = (String(order||'asc').toLowerCase() === 'desc') ? 'desc' : 'asc';
+  return { [field]: dir };
+}
+
+function buildWhere({ status, doctorId, specialtyId, patientIds, patientId, dateFrom, dateTo }) {
+  const where = {};
+  const st = mapStatus(status);
+  if (st) where.status = st;
+  if (doctorId) where.doctorId = doctorId;
+  if (specialtyId) where.specialtyId = specialtyId;
+  if (patientId) where.patientId = patientId;
+  if (patientIds && patientIds.length) where.patientId = { in: patientIds };
+  const dr = toDayRange(dateFrom, dateTo);
+  if (dr) where.appointmentDate = dr;
+  return where;
 }
 
 async function assertDoctorAvailability(doctorId, appointmentDate, duration) {
-  // 1) existe schedule activo para el día y hora
   const dayOfWeek = appointmentDate.getUTCDay();
   const hh = appointmentDate.getUTCHours();
   const mm = appointmentDate.getUTCMinutes();
-  const timeStr = `${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}`;
-  const schedules = await prisma.schedule.findMany({ where: { doctorId, dayOfWeek, isActive: true } });
-  const slotM = parseTimeToMinutes(timeStr);
-  const fitsInSchedule = schedules.some(s => {
+  const slotStr = `${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}`;
+  const schedules = await prisma.schedule.findMany({ where: { doctorId, dayOfWeek, isActive: true }, include: { blockedSlots: true } });
+  if (!schedules.length) throw appErr('No hay horario configurado para el médico ese día', 409, 'NO_SCHEDULE');
+  const slotMin = parseTimeToMinutes(slotStr);
+  let inSchedule = false;
+  for (const s of schedules) {
     const sStart = parseTimeToMinutes(s.startTime);
     const sEnd = parseTimeToMinutes(s.endTime);
-    return slotM >= sStart && (slotM + duration) <= sEnd;
-  });
-  if (!fitsInSchedule) {
-    const err = new Error('Hora fuera del horario del médico'); err.statusCode = 409; throw err;
+    if (slotMin >= sStart && (slotMin + duration) <= sEnd) {
+      inSchedule = true;
+      const grid = s.slotDuration || duration;
+      if ((slotMin - sStart) % grid !== 0) throw appErr('La hora no está alineada a la grilla de slotDuration', 409, 'GRID_MISALIGNED');
+      const isBlocked = (s.blockedSlots || []).some(b => b.blockedDate.toISOString().slice(0,10) === appointmentDate.toISOString().slice(0,10)
+        && slotMin >= parseTimeToMinutes(b.startTime) && slotMin < parseTimeToMinutes(b.endTime));
+      if (isBlocked) throw appErr('La hora está bloqueada', 409, 'BLOCKED_SLOT');
+      break;
+    }
   }
-
-  // 2) no existe cita que se solape (excluye CANCELLED/NO_SHOW)
-  const dayStart = new Date(Date.UTC(appointmentDate.getUTCFullYear(), appointmentDate.getUTCMonth(), appointmentDate.getUTCDate(), 0, 0, 0));
-  const dayEnd = new Date(Date.UTC(appointmentDate.getUTCFullYear(), appointmentDate.getUTCMonth(), appointmentDate.getUTCDate(), 23, 59, 59, 999));
-  const taken = await prisma.appointment.findMany({ where: { doctorId, appointmentDate: { gte: dayStart, lte: dayEnd }, status: { notIn: ['CANCELLED','NO_SHOW'] } } });
-  const slotKey = timeStr;
-  const conflict = taken.find(ap => {
+  if (!inSchedule) throw appErr('Hora fuera del horario del médico', 409, 'OUT_OF_SCHEDULE');
+  const dayStart = startOfDay(appointmentDate);
+  const dayEnd = endOfDay(appointmentDate);
+  const existing = await prisma.appointment.findMany({ where: { doctorId, appointmentDate: { gte: dayStart, lte: dayEnd }, status: { in: ACTIVE_STATES } } });
+  for (const ap of existing) {
     const apH = ap.appointmentDate.getUTCHours();
     const apM = ap.appointmentDate.getUTCMinutes();
-    const apStartM = parseTimeToMinutes(`${String(apH).padStart(2,'0')}:${String(apM).padStart(2,'0')}`);
-    const apEndM = apStartM + ap.duration;
-    const newEnd = slotM + duration;
-    return (slotM < apEndM && apStartM < newEnd);
-  });
-  if (conflict) { const err = new Error('La hora ya está ocupada'); err.statusCode = 409; throw err; }
-
-  // 3) no está dentro de bloqueos
-  const schedulesWithBlocks = await prisma.schedule.findMany({ where: { doctorId, dayOfWeek, isActive: true }, include: { blockedSlots: true } });
-  const inBlocked = schedulesWithBlocks.some(s => (s.blockedSlots || []).some(b => b.blockedDate.toISOString().startsWith(dayStart.toISOString().slice(0,10)) && slotM >= parseTimeToMinutes(b.startTime) && slotM < parseTimeToMinutes(b.endTime)));
-  if (inBlocked) { const err = new Error('La hora está bloqueada'); err.statusCode = 409; throw err; }
+    const apStart = parseTimeToMinutes(`${String(apH).padStart(2,'0')}:${String(apM).padStart(2,'0')}`);
+    const apEnd = apStart + ap.duration;
+    const newEnd = slotMin + duration;
+    if (slotMin < apEnd && apStart < newEnd) throw appErr('La hora ya está ocupada', 409, 'OVERLAPPING_APPOINTMENT');
+  }
 }
 
-async function createAppointment({ patientId, doctorId, specialtyId, appointmentDate, duration = 30, reason }, currentUser) {
-  validateObjectId(doctorId,'doctorId');
-  validateObjectId(patientId,'patientId');
-  if (specialtyId) validateObjectId(specialtyId,'specialtyId');
-  const date = new Date(appointmentDate);
-  if (Number.isNaN(date.getTime())) { const err = new Error('appointmentDate inválida'); err.statusCode = 400; throw err; }
-  if (duration <= 0) { const err = new Error('duration debe ser > 0'); err.statusCode = 400; throw err; }
-
-  // Regla: un médico solo agenda sus propias citas, a menos que sea ADMIN
-  if (currentUser?.role !== 'ADMINISTRADOR' && currentUser?.id !== doctorId) {
-    const err = new Error('No puedes crear citas para otros médicos'); err.statusCode = 403; throw err;
-  }
-
-  await assertDoctorAvailability(doctorId, date, duration);
-
-  const appointment = await prisma.appointment.create({
-    data: {
-      patientId, doctorId, specialtyId: specialtyId || null,
-      appointmentDate: date,
-      duration,
-      reason: reason || null,
-      status: 'SCHEDULED',
-    }
+async function svcCreateAppointment({ actorId, data }) {
+  const start = parseDate(data.appointmentDate);
+  const now = new Date();
+  if (start.getTime() < now.getTime()) throw appErr('No se puede programar en el pasado', 400, 'PAST_APPOINTMENT');
+  await assertDoctorAvailability(data.doctorId, start, data.duration || 30);
+  const created = await prisma.$transaction(async (tx) => {
+    const appt = await tx.appointment.create({
+      data: {
+        patientId: data.patientId,
+        doctorId: data.doctorId,
+        specialtyId: data.specialtyId ?? null,
+        appointmentDate: start,
+        duration: data.duration ?? 30,
+        reason: data.reason ?? null,
+        notes: data.notes ?? null,
+        status: 'SCHEDULED'
+      }
+    });
+    await tx.appointmentHistory.create({
+      data: {
+        appointmentId: appt.id,
+        action: 'CREATED',
+        previousStatus: null,
+        newStatus: 'SCHEDULED',
+        previousData: null,
+        newData: { patientId: appt.patientId, doctorId: appt.doctorId, appointmentDate: appt.appointmentDate, duration: appt.duration, reason: appt.reason, notes: appt.notes },
+        changedFields: ['patientId','doctorId','appointmentDate','duration','reason','notes','status'],
+        changedBy: actorId ?? null,
+        changedByRole: 'SYSTEM'
+      }
+    });
+    return appt;
   });
-
-  await prisma.appointmentHistory.create({
-    data: {
-      appointmentId: appointment.id,
-      action: 'CREATED',
-      newStatus: 'SCHEDULED',
-      newData: { patientId, doctorId, appointmentDate: date.toISOString(), duration, reason },
-      changedBy: currentUser?.id || null,
-      changedByRole: currentUser?.role || null,
-      ipAddress: null,
-      userAgent: null,
-    }
-  });
-
-  return appointment;
+  return created;
 }
 
-async function updateAppointmentStatus(id, newStatus, currentUser) {
-  validateObjectId(id,'id');
-  const exists = await prisma.appointment.findUnique({ where: { id } });
-  if (!exists) { const err = new Error('Cita no encontrada'); err.statusCode = 404; throw err; }
-  if (currentUser?.role !== 'ADMINISTRADOR' && currentUser?.id !== exists.doctorId) {
-    const err = new Error('No puedes modificar citas de otros médicos'); err.statusCode = 403; throw err;
+async function svcGetAppointmentById(id) {
+  const appt = await prisma.appointment.findUnique({ where: { id } });
+  if (!appt) throw appErr('Cita no encontrada', 404, 'NOT_FOUND');
+  return appt;
+}
+
+async function svcListAppointments(query, authHeader) {
+  const { status, doctorId, specialty, specialtyId, patientName, page, limit, dateFrom, dateTo, orderBy, order } = query;
+  // specialty mapping TODO
+  const patientIds = await resolvePatientIdsByName(patientName, authHeader);
+  const where = buildWhere({ status, doctorId, specialtyId: specialtyId, patientIds, dateFrom, dateTo });
+  const { skip, take, page: p, limit: l } = parsePagination(page, limit);
+  const orderObj = buildOrder(orderBy, order);
+  const [items, total] = await Promise.all([
+    prisma.appointment.findMany({ where, orderBy: orderObj, skip, take }),
+    prisma.appointment.count({ where })
+  ]);
+  return { data: items, pagination: { total, pages: Math.ceil(total / l), page: p, limit: l }, filters: { status, doctorId, specialty: specialty || specialtyId, patientName, dateFrom, dateTo, orderBy: Object.keys(orderObj)[0], order: Object.values(orderObj)[0] } };
+}
+
+async function svcListByPatient(query, authHeader) {
+  const { patientId, status, doctorId, specialtyId, page, limit, dateFrom, dateTo, orderBy, order } = query;
+  const where = buildWhere({ status, doctorId, specialtyId, patientId, dateFrom, dateTo });
+  const { skip, take, page: p, limit: l } = parsePagination(page, limit);
+  const orderObj = buildOrder(orderBy, order);
+  const [items, total] = await Promise.all([
+    prisma.appointment.findMany({ where, orderBy: orderObj, skip, take }),
+    prisma.appointment.count({ where })
+  ]);
+  return { data: items, pagination: { total, pages: Math.ceil(total / l), page: p, limit: l }, filters: { patientId, status, doctorId, specialty: specialtyId, dateFrom, dateTo, orderBy: Object.keys(orderObj)[0], order: Object.values(orderObj)[0] } };
+}
+
+async function svcListByDoctor(query, authHeader) {
+  const { doctorId, status, specialtyId, patientName, page, limit, dateFrom, dateTo, orderBy, order } = query;
+  const patientIds = await resolvePatientIdsByName(patientName, authHeader);
+  const where = buildWhere({ status, doctorId, specialtyId, patientIds, dateFrom, dateTo });
+  const { skip, take, page: p, limit: l } = parsePagination(page, limit);
+  const orderObj = buildOrder(orderBy, order);
+  const [items, total] = await Promise.all([
+    prisma.appointment.findMany({ where, orderBy: orderObj, skip, take }),
+    prisma.appointment.count({ where })
+  ]);
+  return { data: items, pagination: { total, pages: Math.ceil(total / l), page: p, limit: l }, filters: { doctorId, status, specialty: specialtyId, patientName, dateFrom, dateTo, orderBy: Object.keys(orderObj)[0], order: Object.values(orderObj)[0] } };
+}
+
+async function svcUpdateAppointment({ actorId, id, data }) {
+  const current = await prisma.appointment.findUnique({ where: { id } });
+  if (!current) throw appErr('Cita no encontrada', 404, 'NOT_FOUND');
+  let newDate;
+  if (data.appointmentDate) {
+    newDate = parseDate(data.appointmentDate);
+    const now = new Date();
+    if (newDate.getTime() < now.getTime()) throw appErr('No se puede programar en el pasado', 400, 'PAST_APPOINTMENT');
   }
-  const prev = exists.status;
-  const updated = await prisma.appointment.update({ where: { id }, data: { status: newStatus } });
-  await prisma.appointmentHistory.create({
-    data: {
-      appointmentId: id,
-      action: 'STATUS_CHANGED',
-      previousStatus: prev,
-      newStatus,
-      changedBy: currentUser?.id || null,
-      changedByRole: currentUser?.role || null,
-    }
+  const updateData = {
+    ...(newDate ? { appointmentDate: newDate } : {}),
+    ...(typeof data.duration === 'number' ? { duration: data.duration } : {}),
+    ...(data.status ? { status: data.status } : {}),
+    ...(typeof data.reason === 'string' ? { reason: data.reason } : {}),
+    ...(typeof data.notes === 'string' ? { notes: data.notes } : {})
+  };
+  const updated = await prisma.$transaction(async (tx) => {
+    const appt = await tx.appointment.update({ where: { id }, data: updateData });
+    await tx.appointmentHistory.create({
+      data: {
+        appointmentId: appt.id,
+        action: 'UPDATED',
+        previousStatus: current.status,
+        newStatus: appt.status,
+        previousData: { appointmentDate: current.appointmentDate, duration: current.duration, status: current.status, reason: current.reason, notes: current.notes },
+        newData: { appointmentDate: appt.appointmentDate, duration: appt.duration, status: appt.status, reason: appt.reason, notes: appt.notes },
+        changedFields: Object.keys(updateData),
+        changedBy: actorId ?? null,
+        changedByRole: 'SYSTEM'
+      }
+    });
+    return appt;
   });
   return updated;
 }
 
-module.exports = { createAppointment, updateAppointmentStatus };
+async function svcChangeAppointmentStatus({ id, newStatusLabel, actorId, actorRole, cancellationReason }) {
+  const appt = await prisma.appointment.findUnique({ where: { id } });
+  if (!appt) throw appErr('Cita no encontrada', 404, 'NOT_FOUND');
+  const next = ES_TO_ENUM[(newStatusLabel || '').toUpperCase()];
+  if (!next) throw appErr('Estado inválido', 400, 'INVALID_STATUS');
+  if (actorRole === 'PACIENTE' && ['COMPLETED','IN_PROGRESS'].includes(next)) {
+    throw appErr('No autorizado para cambiar a ese estado', 403, 'FORBIDDEN');
+  }
+  ensureTransition(appt.status, next);
+  const updateData = { status: next };
+  if (next === 'CANCELLED') {
+    updateData.cancelledAt = new Date();
+    if (cancellationReason) updateData.cancellationReason = cancellationReason;
+    updateData.cancelledBy = actorId ?? null;
+  }
+  if (next === 'COMPLETED') updateData.completedAt = new Date();
+  const updated = await prisma.$transaction(async (tx) => {
+    const u = await tx.appointment.update({ where: { id }, data: updateData });
+    await tx.appointmentHistory.create({
+      data: {
+        appointmentId: u.id,
+        action: 'STATUS_CHANGED',
+        previousStatus: appt.status,
+        newStatus: u.status,
+        previousData: { status: appt.status },
+        newData: { status: u.status },
+        changedFields: ['status'],
+        changedBy: actorId ?? null,
+        changedByRole: actorRole || 'SYSTEM'
+      }
+    });
+    return u;
+  });
+  return updated;
+}
+
+async function svcCancelAppointment({ id, actorId, actorRole, reason }) {
+  const appt = await prisma.appointment.findUnique({ where: { id } });
+  if (!appt) throw appErr('Cita no encontrada', 404, 'NOT_FOUND');
+  if (['CANCELLED','COMPLETED'].includes(appt.status)) return appt;
+  const updated = await prisma.$transaction(async (tx) => {
+    const u = await tx.appointment.update({ where: { id }, data: { status: 'CANCELLED', cancelledAt: new Date(), cancellationReason: reason || 'Cancelled via DELETE', cancelledBy: actorId ?? null } });
+    await tx.appointmentHistory.create({ data: { appointmentId: u.id, action: 'CANCELLED', previousStatus: appt.status, newStatus: 'CANCELLED', previousData: { status: appt.status }, newData: { status: 'CANCELLED', cancellationReason: reason || null }, changedFields: ['status','cancelledAt','cancellationReason','cancelledBy'], changedBy: actorId ?? null, changedByRole: actorRole || 'SYSTEM' } });
+    return u;
+  });
+  return updated;
+}
+
+function safeDayStart(s) {
+  if (!s) return null;
+  const d = parseISO(s.length > 10 ? s : `${s}T00:00:00.000Z`);
+  if (!isValid(d)) return null;
+  return startOfDay(d);
+}
+function safeDayEnd(s) {
+  if (!s) return null;
+  const d = parseISO(s.length > 10 ? s : `${s}T00:00:00.000Z`);
+  if (!isValid(d)) return null;
+  return endOfDay(d);
+}
+
+async function svcListByDateRange({ dateFrom, dateTo, doctorId, patientId, status }) {
+  const where = {};
+  const from = safeDayStart(dateFrom);
+  const to = safeDayEnd(dateTo);
+  if (from || to) {
+    where.appointmentDate = {};
+    if (from) where.appointmentDate.gte = from;
+    if (to) where.appointmentDate.lte = to;
+  }
+  if (doctorId) where.doctorId = doctorId;
+  if (patientId) where.patientId = patientId;
+  if (status) {
+    const mapped = ES_TO_ENUM[String(status).toUpperCase()] || String(status).toUpperCase();
+    where.status = mapped;
+  }
+  const list = await prisma.appointment.findMany({ where, orderBy: { appointmentDate: 'asc' } });
+  return { filters: { dateFrom, dateTo, doctorId, patientId, status }, total: list.length, items: list };
+}
+
+module.exports = {
+  svcListAppointments,
+  svcListByPatient,
+  svcListByDoctor,
+  svcCreateAppointment,
+  svcGetAppointmentById,
+  svcUpdateAppointment,
+  svcChangeAppointmentStatus,
+  svcCancelAppointment,
+  svcListByDateRange,
+};
