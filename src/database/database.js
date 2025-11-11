@@ -1,46 +1,36 @@
-const mongoose = require("mongoose");
-const { PrismaClient } = require("../generated/prisma");
+// Prisma MongoDB connection (sin dependencia de Mongoose)
+const { PrismaClient } = require('../generated/prisma');
 
-const prisma = new PrismaClient();
+const LOG_LEVEL = process.env.NODE_ENV === 'development'
+  ? ['query', 'info', 'warn', 'error']
+  : ['error'];
 
-// Configuración de conexión a MongoDB
-const connectDatabase = async () => {
+const prisma = new PrismaClient({ log: LOG_LEVEL });
+let isConnected = false;
+
+async function connectDatabase() {
+  if (isConnected) return true;
   try {
-    const DATABASE_URL = process.env.DATABASE_URL;
-
-    if (!DATABASE_URL) {
-      throw new Error("Variable de entorno DATABASE_URL no definida");
-    }
-
-    await mongoose.connect(DATABASE_URL, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-    });
-
-    console.log("Conexión a MongoDB establecida correctamente");
-
-    // Verificar la conexión a Prisma
     await prisma.$connect();
-    console.log("Conexión a Prisma establecida correctamente");
-  } catch (error) {
-    console.error("Error al conectar a la base de datos:", error.message);
+    try { if (prisma.$runCommandRaw) await prisma.$runCommandRaw({ ping: 1 }); } catch (_) {}
+    isConnected = true;
+    console.log('✓ Database (Prisma MongoDB) conectada');
+    return true;
+  } catch (err) {
+    console.error('✗ Error de conexión a la base de datos:', err.message || err);
     process.exit(1);
   }
-};
+}
 
-// Función para cerrar la conexión (útil para pruebas)
-const closeDatabase = async () => {
-  try {
-    await mongoose.disconnect();
-    await prisma.$disconnect();
-    console.log("Conexión a la base de datos cerrada correctamente");
-  } catch (error) {
-    console.error("Error al cerrar la conexión a la base de datos:", error.message);
+async function disconnectDatabase() {
+  try { await prisma.$disconnect(); } catch (_) {} finally {
+    isConnected = false;
+    console.log('Database desconectada');
   }
-};
+}
 
-module.exports = {
-  connectDatabase,
-  closeDatabase,
-  prisma
-};
+process.on('SIGINT', async () => { await disconnectDatabase(); process.exit(0); });
+process.on('SIGTERM', async () => { await disconnectDatabase(); process.exit(0); });
+process.on('beforeExit', async () => { await disconnectDatabase(); });
+
+module.exports = { prisma, connectDatabase, disconnectDatabase };

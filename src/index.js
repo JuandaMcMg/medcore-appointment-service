@@ -3,6 +3,9 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
+const { connectDatabase } = require('./database/database');
+const scheduleRoutes = require('./routes/scheduleRoutes');
+const appointmentRoutes = require('./routes/appointmentRoutes');
 
 const app = express();
 const PORT = process.env.PORT || 3007;
@@ -18,6 +21,8 @@ app.use(express.urlencoded({ extended: true }));
 // ============================================
 // RUTAS
 // ============================================
+app.use('/api', scheduleRoutes);
+app.use('/api', appointmentRoutes);
 
 // Health check
 app.get('/health', (req, res) => {
@@ -62,14 +67,17 @@ app.use((err, req, res, next) => {
 // START SERVER
 // ============================================
 
-app.listen(PORT, () => {
-  console.log(`
-  ╔═══════════════════════════════════════════════════╗
-  ║   MedCore Appointment Service                     ║
-  ║   Port: ${PORT}                                    ║
-  ║   Status: ✓ Running                               ║
-  ╚═══════════════════════════════════════════════════╝
-  `);
-});
+(async () => {
+  await connectDatabase();
+  app.listen(PORT, () => {
+    console.log(`
+    ╔═══════════════════════════════════════════════════╗
+    ║   MedCore Appointment Service                     ║
+    ║   Port: ${PORT}                                    ║
+    ║   Status: ✓ Running                               ║
+    ╚═══════════════════════════════════════════════════╝
+    `);
+  });
+})();
 
 module.exports = app;
