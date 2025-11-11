@@ -3,6 +3,8 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
+const { connectDatabase } = require('./database/database');
+const apiV1 = require('./routes/routes');
 
 const app = express();
 const PORT = process.env.PORT || 3007;
@@ -37,6 +39,9 @@ app.get('/', (req, res) => {
   });
 });
 
+// Rutas v1
+app.use('/api/v1', apiV1);
+
 // ============================================
 // ERROR HANDLERS
 // ============================================
@@ -61,7 +66,7 @@ app.use((err, req, res, next) => {
 // ============================================
 // START SERVER
 // ============================================
-
+connectDatabase();
 app.listen(PORT, () => {
   console.log(`
   ╔═══════════════════════════════════════════════════╗
@@ -70,6 +75,7 @@ app.listen(PORT, () => {
   ║   Status: ✓ Running                               ║
   ╚═══════════════════════════════════════════════════╝
   `);
+  connectDatabase();
 });
 
 module.exports = app;

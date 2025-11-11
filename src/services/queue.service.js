@@ -1,0 +1,245 @@
+const { PrismaClient, QueueStatus } = require('../generated/prisma'); // <- ajusta la ruta si tu build genera en otro lugar
+const prisma = new PrismaClient();
+
+function startOfDay(d = new Date()) {
+  const x = new Date(d);
+  x.setHours(0,0,0,0);
+  return x;
+}
+function endOfDay(d = new Date()) {
+  const x = new Date(d);
+  x.setHours(23,59,59,999);
+  return x;
+}
+
+async function averageServiceMinutes(doctorId) {
+  // Últimos 50 completados con tiempos válidos
+  const completed = await prisma.queueTicket.findMany({
+    where: {
+      doctorId,
+      status: 'COMPLETED',
+      startedAt: { not: null },
+      completedAt: { not: null },
+    },
+    orderBy: { completedAt: 'desc' },
+    take: 50,
+    select: { startedAt: true, completedAt: true }
+  });
+
+  if (!completed.length) return 15; // fallback (min)
+  const mins = completed.map(t => (t.completedAt - t.startedAt) / (1000*60)).filter(n => n > 0);
+  if (!mins.length) return 15;
+  const avg = mins.reduce((a,b)=>a+b,0) / mins.length;
+  return Math.max(5, Math.round(avg)); // mínimo razonable 5 min
+}
+
+async function nextTicketNumberToday(doctorId) {
+  const sod = startOfDay();
+  const eod = endOfDay();
+
+  const last = await prisma.queueTicket.findFirst({
+    where: { doctorId, queueDate: { gte: sod, lte: eod } },
+    orderBy: [{ ticketNumber: 'desc' }, { createdAt: 'desc' }],
+    select: { ticketNumber: true }
+  });
+
+  return (last?.ticketNumber || 0) + 1;
+}
+
+async function countAhead(doctorId, createdAt) {
+  const sod = startOfDay(createdAt || new Date());
+  const eod = endOfDay(createdAt || new Date());
+  const n = await prisma.queueTicket.count({
+    where: {
+      doctorId,
+      queueDate: { gte: sod, lte: eod },
+      status: { in: ['WAITING', 'CALLED', 'IN_PROGRESS'] },
+      createdAt: { lt: createdAt } // los que entraron antes
+    }
+  });
+  return n;
+}
+
+exports.joinQueue = async ({ actorId, doctorId, patientId, appointmentId }) => {
+  const sod = startOfDay();
+  const eod = endOfDay();
+
+  // Evitar duplicado del mismo paciente en la cola de hoy para ese médico
+  const exists = await prisma.queueTicket.findFirst({
+    where: {
+      doctorId, patientId,
+      queueDate: { gte: sod, lte: eod },
+      status: { in: ['WAITING', 'CALLED', 'IN_PROGRESS'] }
+    },
+    select: { id: true, status: true, ticketNumber: true }
+  });
+  if (exists) {
+    const posInfo = await exports.getTicketPosition({ ticketId: exists.id });
+    return { ...posInfo, duplicate: true };
+  }
+
+  // calcular número y crear
+  const number = await nextTicketNumberToday(doctorId);
+
+  const ticket = await prisma.queueTicket.create({
+    data: {
+      doctorId,
+      patientId,
+      appointmentId: appointmentId || null,
+      ticketNumber: number,
+      queueDate: new Date(),
+      status: 'WAITING'
+    }
+  });
+
+  const ahead = await countAhead(doctorId, ticket.createdAt);
+  const avgMin = await averageServiceMinutes(doctorId);
+  const eta = ahead * avgMin;
+
+  // guardar estimación y posición
+  const updated = await prisma.queueTicket.update({
+    where: { id: ticket.id },
+    data: { estimatedWaitTime: eta, position: ahead + 1 }
+  });
+
+  return {
+    ticketId: updated.id,
+    ticketNumber: updated.ticketNumber,
+    position: updated.position,
+    estimatedWaitTime: updated.estimatedWaitTime,
+    status: updated.status
+  };
+};
+
+exports.getDoctorCurrentQueue = async ({ doctorId }) => {
+  const sod = startOfDay(); const eod = endOfDay();
+
+  const [queue, avgMin] = await Promise.all([
+    prisma.queueTicket.findMany({
+      where: {
+        doctorId,
+        queueDate: { gte: sod, lte: eod },
+        status: { in: ['WAITING', 'CALLED', 'IN_PROGRESS'] }
+      },
+      orderBy: [{ ticketNumber: 'asc' }],
+      select: {
+        id: true, ticketNumber: true, status: true,
+        patientId: true, appointmentId: true,
+        createdAt: true, calledAt: true, startedAt: true, position: true, estimatedWaitTime: true
+      }
+    }),
+    averageServiceMinutes(doctorId)
+  ]);
+
+  return {
+    doctorId,
+    averageServiceMinutes: avgMin,
+    size: queue.length,
+    queue
+  };
+};
+
+exports.callNextForDoctor = async ({ doctorId, actorId }) => {
+  const sod = startOfDay(); const eod = endOfDay();
+
+  // Tomar el primer WAITING por número de ticket
+  const next = await prisma.queueTicket.findFirst({
+    where: {
+      doctorId,
+      queueDate: { gte: sod, lte: eod },
+      status: 'WAITING'
+    },
+    orderBy: [{ ticketNumber: 'asc' }]
+  });
+
+  if (!next) throw { code: 'EMPTY_QUEUE', message: 'No hay pacientes en espera', statusCode: 404 };
+
+  // marcar como CALLED; si el médico inicia, podría ponerse IN_PROGRESS después
+  const called = await prisma.queueTicket.update({
+    where: { id: next.id },
+    data: { status: 'CALLED', calledAt: new Date() }
+  });
+
+  // Recalcular posiciones/ETA del resto
+  const rest = await prisma.queueTicket.findMany({
+    where: {
+      doctorId,
+      queueDate: { gte: sod, lte: eod },
+      status: { in: ['WAITING'] }
+    },
+    orderBy: [{ ticketNumber: 'asc' }]
+  });
+
+  const avgMin = await averageServiceMinutes(doctorId);
+  await Promise.all(rest.map((t, idx) =>
+    prisma.queueTicket.update({
+      where: { id: t.id },
+      data: { position: idx + 2, estimatedWaitTime: (idx + 1) * avgMin }
+    })
+  ));
+
+  return { ticketId: called.id, ticketNumber: called.ticketNumber, status: called.status, calledAt: called.calledAt };
+};
+
+exports.completeTicket = async ({ ticketId, actorId }) => {
+  // Si aún no estaba "IN_PROGRESS", marcamos inicio ahora
+  const current = await prisma.queueTicket.findUnique({ where: { id: ticketId }});
+  if (!current) throw { code: 'TICKET_NOT_FOUND', message: 'Ticket no existe', statusCode: 404 };
+
+  const now = new Date();
+  const startedAt = current.startedAt || current.calledAt || now;
+
+  const done = await prisma.queueTicket.update({
+    where: { id: ticketId },
+    data: { status: 'COMPLETED', startedAt, completedAt: now }
+  });
+
+  // Ajustar posiciones del resto (una persona menos delante)
+  const sod = startOfDay(); const eod = endOfDay();
+  const avgMin = await averageServiceMinutes(done.doctorId);
+
+  const waiting = await prisma.queueTicket.findMany({
+    where: {
+      doctorId: done.doctorId,
+      queueDate: { gte: sod, lte: eod },
+      status: { in: ['WAITING'] }
+    },
+    orderBy: [{ ticketNumber: 'asc' }]
+  });
+
+  await Promise.all(waiting.map((t, idx) =>
+    prisma.queueTicket.update({
+      where: { id: t.id },
+      data: { position: idx + 1, estimatedWaitTime: idx * avgMin }
+    })
+  ));
+
+  return { ticketId: done.id, status: done.status, completedAt: done.completedAt };
+};
+
+exports.getTicketPosition = async ({ ticketId }) => {
+  const t = await prisma.queueTicket.findUnique({ where: { id: ticketId }});
+  if (!t) throw { code: 'TICKET_NOT_FOUND', message: 'Ticket no existe', statusCode: 404 };
+
+  const ahead = await countAhead(t.doctorId, t.createdAt);
+  const avgMin = await averageServiceMinutes(t.doctorId);
+
+  // Si el ticket ya fue llamado o está en progreso, ahead podría ser 0
+  const position = Math.max(1, (t.status === 'WAITING') ? ahead + 1 : 1);
+  const eta = (position - 1) * avgMin;
+
+  // sincronizamos datos guardados
+  await prisma.queueTicket.update({
+    where: { id: t.id },
+    data: { position, estimatedWaitTime: eta }
+  });
+
+  return {
+    ticketId: t.id,
+    doctorId: t.doctorId,
+    ticketNumber: t.ticketNumber,
+    status: t.status,
+    position,
+    estimatedWaitTime: eta
+  };
+};

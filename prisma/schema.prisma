@@ -94,12 +94,12 @@ model Appointment {
   // Relaciones
   history     AppointmentHistory[]
   queueTicket QueueTicket?
+  //@@unique([doctorId, appointmentDate], name: "unique_doctor_appointment")
 
   @@index([patientId, appointmentDate])
   @@index([doctorId, appointmentDate])
   @@index([status])
   @@map("appointments")
-  //@@unique([doctorId, appointmentDate], name: "unique_doctor_appointment")
 }
 
 // Historial/auditoría de cambios de cita
