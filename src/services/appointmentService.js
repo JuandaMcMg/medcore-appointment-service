@@ -16,7 +16,8 @@ const ES_TO_ENUM = {
   PROGRAMADA: 'SCHEDULED',
   CANCELADA: 'CANCELLED',
   COMPLETADA: 'COMPLETED',
-  REAGENDADA: 'RESCHEDULED'
+  REAGENDADA: 'RESCHEDULED',
+  CONFIRMADA: 'CONFIRMED'
 };
 
 const VALID_TRANSITIONS = {
@@ -195,15 +196,97 @@ async function svcListAppointments(query, authHeader) {
 }
 
 async function svcListByPatient(query, authHeader) {
-  const { patientId, status, doctorId, specialtyId, page, limit, dateFrom, dateTo, orderBy, order } = query;
-  const where = buildWhere({ status, doctorId, specialtyId, patientId, dateFrom, dateTo });
+  const {
+    patientId,
+    status,
+    doctorId,
+    specialtyId,
+    page,
+    limit,
+    dateFrom,
+    dateTo,
+    orderBy,
+    order,
+  } = query;
+
+  // 1️⃣ Construcción del filtro y orden
+  const where = buildWhere({
+    status,
+    doctorId,
+    specialtyId,
+    patientId,
+    dateFrom,
+    dateTo,
+  });
+
   const { skip, take, page: p, limit: l } = parsePagination(page, limit);
   const orderObj = buildOrder(orderBy, order);
+
+  // 2️⃣ Consultar las citas
   const [items, total] = await Promise.all([
     prisma.appointment.findMany({ where, orderBy: orderObj, skip, take }),
-    prisma.appointment.count({ where })
+    prisma.appointment.count({ where }),
   ]);
-  return { data: items, pagination: { total, pages: Math.ceil(total / l), page: p, limit: l }, filters: { patientId, status, doctorId, specialty: specialtyId, dateFrom, dateTo, orderBy: Object.keys(orderObj)[0], order: Object.values(orderObj)[0] } };
+
+  if (items.length === 0) {
+    return {
+      data: [],
+      pagination: { total: 0, pages: 0, page: p, limit: l },
+      filters: { patientId, status, doctorId, specialty: specialtyId, dateFrom, dateTo, orderBy, order },
+    };
+  }
+
+  // 3️⃣ Extraer IDs únicos
+  const doctorIds = [...new Set(items.map(c => c.doctorId))];
+  const specialtyIds = [...new Set(items.filter(c => c.specialtyId).map(c => c.specialtyId))];
+
+  // 4️⃣ Consultar microservicios externos
+  let doctors = [];
+  let specialties = [];
+
+  try {
+    const [doctorsRes, specialtiesRes] = await Promise.all([
+      axios.post("http://localhost:3003/api/v1/users/batch", { ids: doctorIds }, {
+        headers: { Authorization: authHeader },
+      }),
+      /*axios.post("http://localhost:3006/api/v1/specialties/batch", { ids: specialtyIds }, {
+        headers: { Authorization: authHeader },
+      }),*/
+    ]);
+
+    doctors = doctorsRes.data?.data || [];
+    specialties = specialtiesRes.data?.data || [];
+  } catch (err) {
+    console.error("⚠️ Error consultando doctores/especialidades:", err.message);
+  }
+
+  // 5️⃣ Combinar los datos (enriquecer las citas)
+  const enrichedItems = items.map(cita => ({
+    ...cita,
+    doctor: doctors.find(d => d.id === cita.doctorId) || null,
+    specialty: specialties.find(s => s.id === cita.specialtyId) || null,
+  }));
+
+  // 6️⃣ Retornar respuesta formateada
+  return {
+    data: enrichedItems,
+    pagination: {
+      total,
+      pages: Math.ceil(total / l),
+      page: p,
+      limit: l,
+    },
+    filters: {
+      patientId,
+      status,
+      doctorId,
+      specialty: specialtyId,
+      dateFrom,
+      dateTo,
+      orderBy: Object.keys(orderObj)[0],
+      order: Object.values(orderObj)[0],
+    },
+  };
 }
 
 async function svcListByDoctor(query, authHeader) {

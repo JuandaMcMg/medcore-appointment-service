@@ -7,7 +7,7 @@ router.use(verifyToken);
 
 // Crear nueva cita para paciente
 // POST http://localhost:3007/api/v1/appointments/:patientId
-router.post('/:patientId', authorizeRoles('ADMINISTRADOR','PACIENTE'), appointmentController.createAppointment);
+router.post('/:patientId', authorizeRoles('ADMINISTRADOR','PACIENTE'), appointmentController.createAppointment); 
 
 // Obtener cita por ID
 // GET http://localhost:3007/api/v1/appointments/by-id/:id
@@ -15,7 +15,7 @@ router.get('/by-id/:id', authorizeRoles('ADMINISTRADOR', 'PACIENTE', 'MEDICO'), 
 
 // Actualizar cita (fecha/hora/estado/reason/notes/duration)
 // PUT http://localhost:3007/api/v1/appointments/:id
-router.put('/:id', authorizeRoles('ADMINISTRADOR', 'PACIENTE', 'MEDICO'), appointmentController.updateAppointment);
+router.put('/:id', authorizeRoles('ADMINISTRADOR', 'PACIENTE', 'MEDICO'), appointmentController.updateAppointment); 
 
 // Cambiar estado de la cita
 // PATCH http://localhost:3007/api/v1/appointments/status/:id
