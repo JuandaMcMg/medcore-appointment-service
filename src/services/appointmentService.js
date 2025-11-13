@@ -5,6 +5,8 @@ const { parseTimeToMinutes } = require('../utils/time');
 
 const USER_URL = process.env.USER_SERVICE_URL || 'http://localhost:3003';
 const ACTIVE_STATES = ['SCHEDULED', 'CONFIRMED', 'IN_PROGRESS', 'RESCHEDULED'];
+const ALLOWED_DURATIONS = [15, 30, 45, 60];
+const CANCELLABLE_FROM = ['SCHEDULED', 'CONFIRMED', 'RESCHEDULED'];
 
 function parsePagination(page, limit) {
   const p = Math.max(1, parseInt(page || '1', 10));
@@ -59,6 +61,49 @@ function parseDate(d) {
   const dt = new Date(d);
   if (Number.isNaN(dt.getTime())) throw appErr('Fecha inválida', 400, 'INVALID_DATE');
   return dt;
+}
+
+function minutesOfDayUTC(date) {
+  return date.getUTCHours() * 60 + date.getUTCMinutes();
+}
+
+function isOverlapRange(aStart, aEnd, bStart, bEnd) {
+  return aStart < bEnd && bStart < aEnd;
+}
+
+async function assertPatientActiveLimit({ patientId, excludeAppointmentId = null, tx }) {
+  const client = tx || prisma;
+  const count = await client.appointment.count({
+    where: {
+      patientId,
+      status: { in: ACTIVE_STATES },
+      ...(excludeAppointmentId ? { NOT: { id: excludeAppointmentId } } : {})
+    }
+  });
+  if (count >= 3) throw appErr('El paciente ya cuenta con 3 citas activas', 409, 'PATIENT_ACTIVE_LIMIT');
+}
+
+async function assertNoPatientSimultaneous({ patientId, appointmentDate, duration, excludeAppointmentId = null, tx }) {
+  const client = tx || prisma;
+  const dayStart = startOfDay(appointmentDate);
+  const dayEnd = endOfDay(appointmentDate);
+  const startMin = minutesOfDayUTC(appointmentDate);
+  const endMin = startMin + (duration || 0);
+  const sameDayActives = await client.appointment.findMany({
+    where: {
+      patientId,
+      status: { in: ACTIVE_STATES },
+      appointmentDate: { gte: dayStart, lte: dayEnd },
+      ...(excludeAppointmentId ? { NOT: { id: excludeAppointmentId } } : {})
+    },
+    select: { id: true, appointmentDate: true, duration: true }
+  });
+  const clash = sameDayActives.find(a => {
+    const aStart = minutesOfDayUTC(new Date(a.appointmentDate));
+    const aEnd = aStart + (a.duration || 0);
+    return isOverlapRange(startMin, endMin, aStart, aEnd);
+  });
+  if (clash) throw appErr('El paciente ya tiene una cita activa en esa fecha y hora', 409, 'PATIENT_OVERLAP', { clashId: clash.id });
 }
 
 function ensureTransition(prev, next) {
@@ -142,7 +187,11 @@ async function svcCreateAppointment({ actorId, data }) {
   const start = parseDate(data.appointmentDate);
   const now = new Date();
   if (start.getTime() < now.getTime()) throw appErr('No se puede programar en el pasado', 400, 'PAST_APPOINTMENT');
-  await assertDoctorAvailability(data.doctorId, start, data.duration || 30);
+  const duration = typeof data.duration === 'number' ? data.duration : 30;
+  if (!ALLOWED_DURATIONS.includes(duration)) throw appErr('Duración inválida. Use 15, 30, 45 o 60 minutos', 400, 'INVALID_DURATION');
+  await assertDoctorAvailability(data.doctorId, start, duration);
+  await assertPatientActiveLimit({ patientId: data.patientId });
+  await assertNoPatientSimultaneous({ patientId: data.patientId, appointmentDate: start, duration });
   const created = await prisma.$transaction(async (tx) => {
     const appt = await tx.appointment.create({
       data: {
@@ -150,7 +199,7 @@ async function svcCreateAppointment({ actorId, data }) {
         doctorId: data.doctorId,
         specialtyId: data.specialtyId ?? null,
         appointmentDate: start,
-        duration: data.duration ?? 30,
+        duration,
         reason: data.reason ?? null,
         notes: data.notes ?? null,
         status: 'SCHEDULED'
@@ -222,16 +271,23 @@ async function svcListByDoctor(query, authHeader) {
 async function svcUpdateAppointment({ actorId, id, data }) {
   const current = await prisma.appointment.findUnique({ where: { id } });
   if (!current) throw appErr('Cita no encontrada', 404, 'NOT_FOUND');
+  if (typeof data.status !== 'undefined') throw appErr('El estado se actualiza por el endpoint de estado', 400, 'STATUS_NOT_ALLOWED_IN_UPDATE');
   let newDate;
   if (data.appointmentDate) {
     newDate = parseDate(data.appointmentDate);
     const now = new Date();
     if (newDate.getTime() < now.getTime()) throw appErr('No se puede programar en el pasado', 400, 'PAST_APPOINTMENT');
   }
+  const newDuration = typeof data.duration === 'number' ? data.duration : current.duration;
+  if (!ALLOWED_DURATIONS.includes(newDuration)) throw appErr('Duración inválida. Use 15, 30, 45 o 60 minutos', 400, 'INVALID_DURATION');
+  if (newDate || (typeof data.duration === 'number')) {
+    const targetDate = newDate || new Date(current.appointmentDate);
+    await assertDoctorAvailability(current.doctorId, targetDate, newDuration);
+    await assertNoPatientSimultaneous({ patientId: current.patientId, appointmentDate: targetDate, duration: newDuration, excludeAppointmentId: id });
+  }
   const updateData = {
     ...(newDate ? { appointmentDate: newDate } : {}),
-    ...(typeof data.duration === 'number' ? { duration: data.duration } : {}),
-    ...(data.status ? { status: data.status } : {}),
+    ...(typeof data.duration === 'number' ? { duration: newDuration } : {}),
     ...(typeof data.reason === 'string' ? { reason: data.reason } : {}),
     ...(typeof data.notes === 'string' ? { notes: data.notes } : {})
   };
@@ -262,6 +318,9 @@ async function svcChangeAppointmentStatus({ id, newStatusLabel, actorId, actorRo
   if (!next) throw appErr('Estado inválido', 400, 'INVALID_STATUS');
   if (actorRole === 'PACIENTE' && ['COMPLETED','IN_PROGRESS'].includes(next)) {
     throw appErr('No autorizado para cambiar a ese estado', 403, 'FORBIDDEN');
+  }
+  if (next === 'CANCELLED' && !CANCELLABLE_FROM.includes(appt.status)) {
+    throw appErr(`No se puede cancelar desde estado ${appt.status}`, 400, 'INVALID_CANCELLATION');
   }
   ensureTransition(appt.status, next);
   const updateData = { status: next };
@@ -294,7 +353,7 @@ async function svcChangeAppointmentStatus({ id, newStatusLabel, actorId, actorRo
 async function svcCancelAppointment({ id, actorId, actorRole, reason }) {
   const appt = await prisma.appointment.findUnique({ where: { id } });
   if (!appt) throw appErr('Cita no encontrada', 404, 'NOT_FOUND');
-  if (['CANCELLED','COMPLETED'].includes(appt.status)) return appt;
+  if (!CANCELLABLE_FROM.includes(appt.status)) throw appErr(`No se puede cancelar desde estado ${appt.status}`, 400, 'INVALID_CANCELLATION');
   const updated = await prisma.$transaction(async (tx) => {
     const u = await tx.appointment.update({ where: { id }, data: { status: 'CANCELLED', cancelledAt: new Date(), cancellationReason: reason || 'Cancelled via DELETE', cancelledBy: actorId ?? null } });
     await tx.appointmentHistory.create({ data: { appointmentId: u.id, action: 'CANCELLED', previousStatus: appt.status, newStatus: 'CANCELLED', previousData: { status: appt.status }, newData: { status: 'CANCELLED', cancellationReason: reason || null }, changedFields: ['status','cancelledAt','cancellationReason','cancelledBy'], changedBy: actorId ?? null, changedByRole: actorRole || 'SYSTEM' } });
