@@ -26,13 +26,30 @@ async function joinQueue(req, res) {
   } catch (e) { return fail(res, e); }
 };
 
-// GET /queue/doctor/:doctorId/current
+// GET /api/v1/queue/doctor/:doctorId/current?date=2025-11-13&includeFinished=true
 async function getDoctorCurrentQueue(req, res) {
   try {
-    const r = await queueService.getDoctorCurrentQueue({ doctorId: req.params.doctorId });
-    return ok(res, r);
-  } catch (e) { return fail(res, e); }
+    const { date, includeFinished } = req.query;
+
+    const day = date ? new Date(date) : new Date();
+    const includeFinishedBool =
+      String(includeFinished || '').toLowerCase() === 'true';
+
+    const r = await queueService.getDoctorCurrentQueue({
+      doctorId: req.params.doctorId,
+      day,
+      includeFinished: includeFinishedBool,
+    });
+
+    return res.status(200).json({ data: r });
+  } catch (e) {
+    console.error(e);
+    return res.status(e.statusCode || 401).json({
+      error: { code: e.code || 'SERVER_ERROR', message: e.message || 'Error' },
+    });
+  }
 };
+
 
 // POST /queue/doctor/:doctorId/call-next
 async function callNextForDoctor(req, res) {
@@ -58,10 +75,18 @@ async function getTicketPosition(req, res) {
   } catch (e) { return fail(res, e); }
 };
 
+/*async function cancelTicket(req, res) {
+  try {
+    const r = await queueService.CancelTicket({ ticketId: req.params.ticketId });
+    return ok(res, r);
+  } catch (e) { return fail(res, e); }
+};*/
+
 module.exports = {
     joinQueue,
     getDoctorCurrentQueue,
     callNextForDoctor,
     completeTicket,
-    getTicketPosition
+    getTicketPosition,
+    // cancelTicket
 };
