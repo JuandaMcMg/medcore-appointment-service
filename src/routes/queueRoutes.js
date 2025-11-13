@@ -5,9 +5,9 @@ const {verifyToken, authorizeRoles } = require('../middlewares/authMiddleware.js
 
 router.use(verifyToken)
 
-// POST http://localhost:3007/api/v1/queue/join
+// POST http://localhost:3007/api/v1/queue/joi0n
 // UNIRSE A LA COLA DE ESPERA
-router.post('/join', authorizeRoles("ADMINISTRADOR","PACIENTE"), queueController.joinQueue);
+router.post('/join', authorizeRoles("ADMINISTRADOR","PACIENTE", "MEDICO"), queueController.joinQueue);
 
 // GET http://localhost:3007/api/v1/queue/doctor/:doctorId/current
 //Ver la cola de espera del médico
@@ -25,5 +25,6 @@ router.put('/ticket/:ticketId/complete', authorizeRoles('ADMINISTRADOR', 'MEDICO
 //Ver posición en la cola de espera
 router.get('/ticket/:ticketId/position', authorizeRoles('ADMINISTRADOR', 'MEDICO',"PACIENTE"), queueController.getTicketPosition);
 
+//router.delete('/ticket/:ticketId/cancel', authorizeRoles('ADMINISTRADOR', 'PACIENTE', 'MEDICO'), queueController.cancelTicket);
 
 module.exports = router;

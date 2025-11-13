@@ -1,4 +1,5 @@
 const apointmentService = require('../services/appointmentService');
+const notificationService = require('../services/notificationService');
 
 const jsonErr = (res, status, code, message, extra = {}) =>
   res.status(status).json({ ok: false, error: code, message, ...extra });
@@ -31,6 +32,7 @@ async function createAppointment(req, res) {
     if (!payload?.appointmentDate) return jsonErr(res, 400, 'VALIDATION_ERROR', 'appointmentDate es requerido');
     const appt = await apointmentService.svcCreateAppointment({
       actorId: actor.id,
+      authHeader: req.headers.authorization || '',
       data: {
         patientId,
         doctorId: payload.doctorId,
@@ -41,13 +43,23 @@ async function createAppointment(req, res) {
         notes: payload.notes ?? null
       }
     });
-    return res.status(201).json({ ok: true, data: appt });
+    // Dispara correo (no bloquea la respuesta si falla)
+    notificationService.notifyAppointmentCreated({ appt, authHeader: req.headers.authorization || '' })
+      .catch(err => console.warn('[notifyAppointmentCreated] fallo:', err?.message));
+
+    return res.status(201).json({
+      message: "Cita creada exitosamente verifique su correo para más detalles",
+      ok: true, data: appt
+    });
   } catch (e) {
+    console.error('[CREATE APPOINTMENT] error', {
+      code: e.code, status: e.status, msg: e.message, stack: e.stack
+    }); // 👈 te mostrará en terminal
+
     if (e.status && e.code) return jsonErr(res, e.status, e.code, e.message, e.extra);
     return jsonErr(res, 400, 'ERROR_CREATING_APPOINTMENT', 'Error no se pudo crear la cita');
   }
 }
-
 async function getAppointmentById(req, res) {
   try {
     const appt = await apointmentService.svcGetAppointmentById(req.params.id);
@@ -124,6 +136,7 @@ async function deleteAppointment(req, res) {
     const { reason } = req.body || {};
     const actor = actorFromReq(req);
     const appt = await apointmentService.svcCancelAppointment({ id: req.params.id, actorId: actor.id, actorRole: actor.role, reason });
+    notificationService.notifyAppointmentCancelled({ appt, authHeader: req.headers.authorization || '' });
     return res.json({ ok: true, data: appt, message: 'Cita cancelada' });
   } catch (e) {
     if (e.status && e.code) return jsonErr(res, e.status, e.code, e.message);
