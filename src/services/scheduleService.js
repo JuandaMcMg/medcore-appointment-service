@@ -78,6 +78,17 @@ async function updateSchedule(id, updates, currentUser) {
 	return prisma.schedule.update({ where: { id }, data: updates });
 }
 
+async function deleteSchedule(id, currentUser) {
+	validateObjectId(id, 'id');
+	const schedule = await prisma.schedule.findUnique({ where: { id } });
+	if (!schedule) { const err = new Error('Horario no encontrado'); err.statusCode = 404; throw err; }
+	if (currentUser?.role !== 'ADMINISTRADOR' && currentUser?.id !== schedule.doctorId) {
+		const err = new Error('No puedes eliminar horarios de otros médicos'); err.statusCode = 403; throw err;
+	}
+	await prisma.schedule.delete({ where: { id } });
+	return schedule; // devolver para rescheduler
+}
+
 async function listDoctorAppointments(doctorId, currentUser) {
 	validateObjectId(doctorId, 'doctorId');
 	if (currentUser?.role !== 'ADMINISTRADOR' && currentUser?.id !== doctorId) {
@@ -152,6 +163,7 @@ module.exports = {
 	createSchedule,
 	getDoctorSchedules,
 	updateSchedule,
+	deleteSchedule,
 	listDoctorAppointments,
 	getAvailability,
 };
