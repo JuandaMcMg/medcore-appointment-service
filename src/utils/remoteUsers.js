@@ -49,24 +49,53 @@ async function getUserContactByUserId(userId, authHeader) {
 /** Paciente por patientId → toma email y fullname desde patient.user */
 async function getPatientContactByPatientId(patientId, authHeader) {
   const candidates = [
-    `${BASE}/api/v1/users/patients/${patientId}`, // ✅ ruta real de tu servicio
-    // backups por si cambias gateway:
-    `${BASE}/users/patients/${patientId}`,
-    `${BASE}/api/v1/patients/${patientId}`,     // por compatibilidad si luego expones /patients
+    `${BASE}/api/v1/users/patients/${patientId}`, // ruta real del ms-users
+    `${BASE}/users/patients/${patientId}`,        // backups
+    `${BASE}/api/v1/patients/${patientId}`,
   ];
+
   for (const url of candidates) {
     const data = await tryGet(url, authHeader);
     if (!data) continue;
-    // tu handler getById devuelve el objeto patient con .user incluido
+
+    // tu handler getById devuelve patient con .user
     const patient = data.patient || data.data || data;
-    const user = patient?.user;
+    if (!patient || !patient.user) continue;
+
+    const user = patient.user;
     const contact = normContact(user);
-    if (contact?.email || contact?.fullName) return contact;
+
+    return {
+      email: contact.email,
+      fullName: contact.fullName,   // 👈 nombre normalizado
+      status: patient.status || null,
+      patientId: patient.id,
+      userId: patient.userId,
+    };
   }
+
   return null;
 }
+
+/*
+async function getPatientInfo(patientId) {
+  const res = await axios.get($(`${BASE}/users/patients/${patientId}`))
+  const patient = res.data;
+  return{
+    patientId: patient.id,
+    userId: patient.userId,
+    fullname: patient.user.fullname,
+    email: patient.user.email,
+    phone: patient.user.phone,
+    gender: patient.gender,
+    age: patient.age,
+  }
+  
+}
+  */
 
 module.exports = {
   getUserContactByUserId,
   getPatientContactByPatientId,
+  //getPatientInfo
 };

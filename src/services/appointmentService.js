@@ -2,6 +2,8 @@ const { prisma } = require('../database/database');
 const axios = require('axios');
 const { parseISO, startOfDay, endOfDay, isValid } = require('date-fns');
 const { parseTimeToMinutes } = require('../utils/time');
+const users = require('../utils/remoteUsers')
+const queueService = require('../services/queue.service')
 
 const USER_URL = process.env.USER_SERVICE_URL || 'http://localhost:3003';
 const ACTIVE_STATES = ['SCHEDULED', 'CONFIRMED', 'IN_PROGRESS', 'RESCHEDULED'];
@@ -147,6 +149,36 @@ function buildWhere({ status, doctorId, specialtyId, patientIds, patientId, date
   return where;
 }
 
+async function enrichAppointmentsWithContacts(items, authHeader) {
+  if (!Array.isArray(items) || items.length === 0) return items;
+
+  const patientCache = new Map();
+  const doctorCache  = new Map();
+
+  for (const appt of items) {
+    // Paciente
+    if (appt.patientId) {
+      if (!patientCache.has(appt.patientId)) {
+        const p = await users.getPatientContactByPatientId(appt.patientId, authHeader);
+        patientCache.set(appt.patientId, p || null);
+      }
+      appt.patientContact = patientCache.get(appt.patientId);
+    }
+
+    // Doctor
+    if (appt.doctorId) {
+      if (!doctorCache.has(appt.doctorId)) {
+        const d = await users.getUserContactByUserId(appt.doctorId, authHeader); // 👈 AQUÍ estaba el error
+        doctorCache.set(appt.doctorId, d || null);
+      }
+      appt.doctorContact = doctorCache.get(appt.doctorId);
+    }
+  }
+
+  return items;
+}
+
+
 async function assertDoctorAvailability(doctorId, appointmentDate, duration) {
   const dayOfWeek = appointmentDate.getUTCDay();
   const hh = appointmentDate.getUTCHours();
@@ -183,14 +215,30 @@ async function assertDoctorAvailability(doctorId, appointmentDate, duration) {
   }
 }
 
+// Crear una nueva cita
 async function svcCreateAppointment({ actorId, data }) {
   const start = parseDate(data.appointmentDate);
   const now = new Date();
   if (start.getTime() < now.getTime()) throw appErr('No se puede programar en el pasado', 400, 'PAST_APPOINTMENT');
   const duration = typeof data.duration === 'number' ? data.duration : 30;
-  if (!ALLOWED_DURATIONS.includes(duration)) throw appErr('Duración inválida. Use 15, 30, 45 o 60 minutos', 400, 'INVALID_DURATION');
+  //Doctor: no doble booking
+  const dupDotor = await prisma.appointment.findFirst({
+    where: {
+      doctorId: data.doctorId,
+      appointmentDate: start,
+      status: { in: ACTIVE_STATES }
+    },
+    select: { id: true }
+  }); 
+  if (dupDotor) {
+    throw appErr('El médico ya tiene una cita activa en esa fecha y hora', 409, 'DOCTOR_OVERLAP', { clashId: dupDotor.id });
+  }
+
+  //Asegurar disponibilidad del doctor
   await assertDoctorAvailability(data.doctorId, start, duration);
-  await assertPatientActiveLimit({ patientId: data.patientId });
+  
+  //Paciente: límite 3 activas y no doble booking
+  await assertPatientActiveLimit([data.patientId ]);
   await assertNoPatientSimultaneous({ patientId: data.patientId, appointmentDate: start, duration });
   const created = await prisma.$transaction(async (tx) => {
     const appt = await tx.appointment.create({
@@ -220,13 +268,42 @@ async function svcCreateAppointment({ actorId, data }) {
     });
     return appt;
   });
+  //Asignamos un turno en la cola luego de crear la cita
+  try {
+    await queueService.joinQueue({
+      actorId: actorId || null,
+      doctorId: created.doctorId,
+      patientId: created.patientId,
+      appointmentId: created.id
+    });
+  } catch (err) {
+    console.warn(
+      '[svcCreateAppointment] fallo al asignar turno en la cola:',
+      err?.message || err
+    );
+    // NO lanzamos error para no romper la creación de la cita
+  }
+
   return created;
 }
 
-async function svcGetAppointmentById(id) {
+async function svcGetAppointmentById(id, authHeader) {
   const appt = await prisma.appointment.findUnique({ where: { id } });
   if (!appt) throw appErr('Cita no encontrada', 404, 'NOT_FOUND');
-  return appt;
+
+  const patientContact = appt.patientId
+    ? await users.getPatientContactByPatientId(appt.patientId, authHeader)
+    : null;
+
+  const doctorContact = appt.doctorId
+    ? await users.getUserContactByUserId(appt.doctorId, authHeader)
+    : null;
+
+  return {
+    ...appt,
+    patientContact,
+    doctorContact,
+  };
 }
 
 async function svcListAppointments(query, authHeader) {
@@ -240,7 +317,28 @@ async function svcListAppointments(query, authHeader) {
     prisma.appointment.findMany({ where, orderBy: orderObj, skip, take }),
     prisma.appointment.count({ where })
   ]);
-  return { data: items, pagination: { total, pages: Math.ceil(total / l), page: p, limit: l }, filters: { status, doctorId, specialty: specialty || specialtyId, patientName, dateFrom, dateTo, orderBy: Object.keys(orderObj)[0], order: Object.values(orderObj)[0] } };
+
+  await enrichAppointmentsWithContacts(items, authHeader);
+
+  return {
+    data: items,
+    pagination: {
+      total,
+      pages: Math.ceil(total / l),
+      page: p,
+      limit: l
+    },
+    filters: {
+      status,
+      doctorId,
+      specialty: specialty || specialtyId,
+      patientName,
+      dateFrom,
+      dateTo,
+      orderBy: Object.keys(orderObj)[0],
+      order: Object.values(orderObj)[0]
+    }
+  };
 }
 
 async function svcListByPatient(query, authHeader) {
@@ -252,7 +350,28 @@ async function svcListByPatient(query, authHeader) {
     prisma.appointment.findMany({ where, orderBy: orderObj, skip, take }),
     prisma.appointment.count({ where })
   ]);
-  return { data: items, pagination: { total, pages: Math.ceil(total / l), page: p, limit: l }, filters: { patientId, status, doctorId, specialty: specialtyId, dateFrom, dateTo, orderBy: Object.keys(orderObj)[0], order: Object.values(orderObj)[0] } };
+
+  await enrichAppointmentsWithContacts(items, authHeader);
+
+  return {
+    data: items,
+    pagination: {
+      total,
+      pages: Math.ceil(total / l),
+      page: p,
+      limit: l
+    },
+    filters: {
+      patientId,
+      status,
+      doctorId,
+      specialty: specialtyId,
+      dateFrom,
+      dateTo,
+      orderBy: Object.keys(orderObj)[0],
+      order: Object.values(orderObj)[0]
+    }
+  };
 }
 
 async function svcListByDoctor(query, authHeader) {
@@ -265,7 +384,28 @@ async function svcListByDoctor(query, authHeader) {
     prisma.appointment.findMany({ where, orderBy: orderObj, skip, take }),
     prisma.appointment.count({ where })
   ]);
-  return { data: items, pagination: { total, pages: Math.ceil(total / l), page: p, limit: l }, filters: { doctorId, status, specialty: specialtyId, patientName, dateFrom, dateTo, orderBy: Object.keys(orderObj)[0], order: Object.values(orderObj)[0] } };
+
+  await enrichAppointmentsWithContacts(items, authHeader);
+
+  return {
+    data: items,
+    pagination: {
+      total,
+      pages: Math.ceil(total / l),
+      page: p,
+      limit: l
+    },
+    filters: {
+      doctorId,
+      status,
+      specialty: specialtyId,
+      patientName,
+      dateFrom,
+      dateTo,
+      orderBy: Object.keys(orderObj)[0],
+      order: Object.values(orderObj)[0]
+    }
+  };
 }
 
 async function svcUpdateAppointment({ actorId, id, data }) {
