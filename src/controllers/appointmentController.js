@@ -62,7 +62,16 @@ async function createAppointment(req, res) {
 }
 async function getAppointmentById(req, res) {
   try {
-    const appt = await apointmentService.svcGetAppointmentById(req.params.id);
+    const authHeader =
+      req.headers.authorization ||
+      req.headers.Authorization ||
+      null;
+
+    const appt = await apointmentService.svcGetAppointmentById(
+      req.params.id,
+      authHeader
+    );
+
     return res.json({ ok: true, data: appt });
   } catch (e) {
     if (e.status && e.code) return jsonErr(res, e.status, e.code, e.message);
@@ -70,15 +79,25 @@ async function getAppointmentById(req, res) {
   }
 }
 
+
 async function listAppointmentsByPatient(req, res) {
   try {
     const q = pickQuery(req);
     q.patientId = req.params.patientId;
-    const data = await apointmentService.svcListByPatient(q, req.headers.authorization || '');
+
+    const authHeader =
+      req.headers.authorization ||
+      req.headers.Authorization ||
+      null;
+
+    console.log('[listAppointmentsByPatient] authHeader =', authHeader);
+
+    const data = await apointmentService.svcListByPatient(q, authHeader); // 👈 usar la variable
     return res.json({ ok: true, ...data });
   } catch (e) {
+    console.error('[listAppointmentsByPatient] error:', e);
     if (e.status && e.code) return jsonErr(res, e.status, e.code, e.message);
-    return jsonErr(res, 500, 'ERROR_LIST_APPOINTMENTS_BY_PATIENT', 'Error listando citas del paciente');
+    return jsonErr(res, 400, 'ERROR_LIST_APPOINTMENTS_BY_PATIENT', 'Error listando citas del paciente');
   }
 }
 
@@ -86,13 +105,23 @@ async function listAppointmentsByDoctor(req, res) {
   try {
     const q = pickQuery(req);
     q.doctorId = req.params.doctorId;
-    const data = await apointmentService.svcListByDoctor(q, req.headers.authorization || '');
+
+    const authHeader =
+      req.headers.authorization ||
+      req.headers.Authorization ||
+      null;
+
+    console.log('[listAppointmentsByDoctor] authHeader =', authHeader);
+
+    const data = await apointmentService.svcListByDoctor(q, authHeader); // 👈 usar la variable
     return res.json({ ok: true, ...data });
   } catch (e) {
+    console.error('[listAppointmentsByDoctor] error:', e);
     if (e.status && e.code) return jsonErr(res, e.status, e.code, e.message);
     return jsonErr(res, 500, 'ERROR_LIST_APPOINTMENTS_BY_DOCTOR', 'Error listando citas del médico');
   }
 }
+
 
 async function updateAppointment(req, res) {
   try {
