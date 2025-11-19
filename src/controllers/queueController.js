@@ -11,20 +11,38 @@ function fail(res, error, code = 400) {
 // POST /queue/join
 async function joinQueue(req, res) {
   try {
-    const actorId = req.user?.id;          // paciente autenticado o admin
+
+    console.log("BODY recibido en joinQueue:", req.body);
+    console.log("Usuario autenticado (req.user):", req.user);
+
+    const actorId = req.user?.id;
     const { doctorId, appointmentId } = req.body || {};
-    if (!doctorId) throw { code: 'DOCTOR_ID_REQUIRED', message: 'doctorId es requerido', statusCode: 422 };
+
+    console.log("doctorId:", doctorId);
+    console.log("appointmentId:", appointmentId);
+    console.log("actorId:", actorId);
+    console.log("patientId detectado:", req.body?.patientId || req.user?.id);
+
+    if (!doctorId)
+      throw { code: 'DOCTOR_ID_REQUIRED', message: 'doctorId es requerido', statusCode: 422 };
 
     const r = await queueService.joinQueue({
       actorId,
       doctorId,
-      patientId: req.body?.patientId || req.user?.id, // si es admin puede mandar patientId, si es paciente tomamos su id
+      patientId: req.body?.patientId || req.user?.id,
       appointmentId: appointmentId || null
     });
 
+    console.log("Resultado joinQueue:", r);
+
     return ok(res, r, 201);
-  } catch (e) { return fail(res, e); }
-};
+
+  } catch (e) {
+    console.error("Error en joinQueue:", e);
+    return fail(res, e);
+  }
+}
+
 
 // GET /api/v1/queue/doctor/:doctorId/current?date=2025-11-13&includeFinished=true
 async function getDoctorCurrentQueue(req, res) {
@@ -75,12 +93,70 @@ async function getTicketPosition(req, res) {
   } catch (e) { return fail(res, e); }
 };
 
+
 /*async function cancelTicket(req, res) {
   try {
     const r = await queueService.CancelTicket({ ticketId: req.params.ticketId });
     return ok(res, r);
   } catch (e) { return fail(res, e); }
 };*/
+
+//+++
+// PUT /queue/ticket/:ticketId/call
+async function callTicket(req, res) {
+  try {
+    const r = await queueService.callTicket({
+      ticketId: req.params.ticketId,
+      actorId: req.user?.id
+    });
+
+    return ok(res, r);
+  } catch (e) {
+    return fail(res, e);
+  }
+}
+
+// PUT /queue/ticket/:ticketId/start
+async function startTicket(req, res) {
+  try {
+    const r = await queueService.startTicket({
+      ticketId: req.params.ticketId,
+      actorId: req.user?.id
+    });
+
+    return ok(res, r);
+  } catch (e) {
+    return fail(res, e);
+  }
+}
+
+async function exitQueue(req, res) {
+  try {
+    return ok(res, {
+      message: "Salida de la cola registrada solo en front."
+    });
+  } catch (e) {
+    return fail(res, e);
+  }
+}
+
+// PUT /queue/ticket/:ticketId/no-show
+async function markNoShow(req, res) {
+  try {
+    const r = await queueService.markNoShow({
+      ticketId: req.params.ticketId,
+      actorId: req.user?.id
+    });
+
+    return ok(res, r);
+  } catch (e) {
+    return fail(res, e);
+  }
+
+  
+}
+
+
 
 module.exports = {
     joinQueue,
@@ -89,4 +165,8 @@ module.exports = {
     completeTicket,
     getTicketPosition,
     // cancelTicket
+    startTicket,
+    callTicket,
+    exitQueue,
+    markNoShow,
 };

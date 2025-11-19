@@ -21,6 +21,12 @@ app.use(express.urlencoded({ extended: true }));
 // RUTAS
 // ============================================
 
+
+app.use((req, res, next) => {
+  console.log("HEADERS RECIBIDOS:", req.headers);
+  next();
+});
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({

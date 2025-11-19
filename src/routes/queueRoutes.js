@@ -17,6 +17,22 @@ router.get('/doctor/:doctorId/current', authorizeRoles('ADMINISTRADOR', 'MEDICO'
 //Llamar al siguiente paciente en la cola de espera del médico
 router.post('/doctor/:doctorId/call-next', authorizeRoles('ADMINISTRADOR', 'MEDICO'), queueController.callNextForDoctor);
 
+//++
+// GET http://localhost:3007/api/v1/queue/ticket/:ticketId/call
+router.put('/ticket/:ticketId/call', authorizeRoles('ADMINISTRADOR', 'MEDICO'), queueController.callTicket);
+
+router.put('/ticket/:ticketId/start', authorizeRoles('ADMINISTRADOR', 'MEDICO'), queueController.startTicket);
+
+router.post("/ticket/:ticketId/exit", queueController.exitQueue);
+
+router.put(
+  "/ticket/:ticketId/no-show",
+  authorizeRoles("ADMINISTRADOR", "MEDICO"),
+  queueController.markNoShow
+);
+
+
+
 // GET http://localhost:3007/api/v1/queue/ticket/:ticketId/complete
 //Marcar como atendido al paciente actual
 router.put('/ticket/:ticketId/complete', authorizeRoles('ADMINISTRADOR', 'MEDICO'), queueController.completeTicket);

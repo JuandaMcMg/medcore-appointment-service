@@ -81,25 +81,54 @@ exports.joinQueue = async ({ actorId, doctorId, patientId, appointmentId }) => {
   const sod = startOfDay();
   const eod = endOfDay();
 
-  // Evitar duplicado del mismo paciente en la cola de hoy para ese médico
+  // =============================
+  // 1. Buscar ticket existente
+  // =============================
   const exists = await prisma.queueTicket.findFirst({
     where: {
-      doctorId, patientId,
+      doctorId,
+      patientId,
       queueDate: { gte: sod, lte: eod },
       status: { in: ['WAITING', 'CALLED', 'IN_PROGRESS'] }
     },
     select: { id: true, status: true, ticketNumber: true }
   });
-  if (exists) {
-    const posInfo = await exports.getTicketPosition({ ticketId: exists.id });
-    return { ...posInfo, duplicate: true };
+
+  // =============================
+  // 2. Función para CONFIRMAR cita
+  // =============================
+  async function confirmAppointment() {
+    if (!appointmentId) return;
+
+    await prisma.appointment.update({
+      where: { id: appointmentId },
+      data: {
+        status: "CONFIRMED",
+        doctorId: doctorId,
+      }
+    });
   }
-  //Limitar número de turnos por doctor
-  //await queuedoctorLimit({ doctorId });
 
-  // calcular número y crear
+  // =============================
+  // 3. CASO: Ticket duplicado
+  // =============================
+  if (exists) {
+    // confirmar cita aunque sea duplicado
+    await confirmAppointment();
+
+    // obtener posición actual
+    const posInfo = await exports.getTicketPosition({ ticketId: exists.id });
+
+    return {
+      ...posInfo,
+      duplicate: true
+    };
+  }
+
+  // =============================
+  // 4. CASO: Crear ticket nuevo
+  // =============================
   const number = await nextTicketNumberToday(doctorId);
-
 
   const ticket = await prisma.queueTicket.create({
     data: {
@@ -112,28 +141,37 @@ exports.joinQueue = async ({ actorId, doctorId, patientId, appointmentId }) => {
     },
   });
 
+  // calcular ahead y ETA
   const ahead = await countAhead(doctorId, ticket.createdAt);
   const avgMin = await averageServiceMinutes(doctorId);
   const eta = ahead * avgMin;
 
-  // guardar estimación y posición
+  // guardar estimación
   const updated = await prisma.queueTicket.update({
     where: { id: ticket.id },
-    data: { estimatedWaitTime: eta, position: ahead + 1 }
+    data: {
+      estimatedWaitTime: eta,
+      position: ahead + 1
+    }
   });
+
+  // confirmar cita cuando se crea ticket
+  await confirmAppointment();
 
   return {
     ticketId: updated.id,
     ticketNumber: updated.ticketNumber,
     position: updated.position,
     estimatedWaitTime: updated.estimatedWaitTime,
-    status: updated.status
+    status: updated.status,
+    duplicate: false
   };
 };
 
 exports.getDoctorCurrentQueue = async ({ doctorId, day = new Date(), includeFinished = false }) => {
   const sod = startOfDay(day);
   const eod = endOfDay(day);
+
 
   const where = {
     doctorId,
@@ -287,17 +325,23 @@ exports.completeTicket = async ({ ticketId, actorId }) => {
 };
 
 exports.getTicketPosition = async ({ ticketId }) => {
-  const t = await prisma.queueTicket.findUnique({ where: { id: ticketId }});
+  const t = await prisma.queueTicket.findUnique({
+    where: { id: ticketId },
+    include: {
+      appointment: {
+        select: { status: true }
+      }
+    }
+  });
+
   if (!t) throw { code: 'TICKET_NOT_FOUND', message: 'Ticket no existe', statusCode: 404 };
 
   const ahead = await countAhead(t.doctorId, t.createdAt);
   const avgMin = await averageServiceMinutes(t.doctorId);
 
-  // Si el ticket ya fue llamado o está en progreso, ahead podría ser 0
   const position = Math.max(1, (t.status === 'WAITING') ? ahead + 1 : 1);
   const eta = (position - 1) * avgMin;
 
-  // sincronizamos datos guardados
   await prisma.queueTicket.update({
     where: { id: t.id },
     data: { position, estimatedWaitTime: eta }
@@ -307,11 +351,131 @@ exports.getTicketPosition = async ({ ticketId }) => {
     ticketId: t.id,
     doctorId: t.doctorId,
     ticketNumber: t.ticketNumber,
-    status: t.status,
+    status: t.status,                     // estado del ticket (WAITING, CALLED, etc.)
+    appointmentStatus: t.appointment?.status || null,   // <<--- AGREGADO
     position,
     estimatedWaitTime: eta
   };
 };
+
+//**
+exports.callTicket = async ({ ticketId }) => {
+  const current = await prisma.queueTicket.findUnique({ where: { id: ticketId }});
+  if (!current) throw { code: 'TICKET_NOT_FOUND', message: 'Ticket no existe', statusCode: 404 };
+
+  const now = new Date();
+
+  const updated = await prisma.queueTicket.update({
+    where: { id: ticketId },
+    data: {
+      status: 'CALLED',
+      calledAt: now
+    }
+  });
+
+  return {
+    ticketId: updated.id,
+    status: updated.status,
+    calledAt: updated.calledAt
+  };
+};
+
+
+
+exports.startTicket = async ({ ticketId }) => {
+  const current = await prisma.queueTicket.findUnique({ where: { id: ticketId }});
+  if (!current) throw { code: 'TICKET_NOT_FOUND', message: 'Ticket no existe', statusCode: 404 };
+
+  const now = new Date();
+
+  const updated = await prisma.queueTicket.update({
+    where: { id: ticketId },
+    data: {
+      status: 'IN_PROGRESS',
+      startedAt: now
+    }
+  });
+
+  return {
+    ticketId: updated.id,
+    status: updated.status,
+    startedAt: updated.startedAt
+  };
+};
+
+exports.markNoShow = async ({ ticketId, actorId }) => {
+  // 1. Verificar que el ticket exista
+  const current = await prisma.queueTicket.findUnique({
+    where: { id: ticketId }
+  });
+
+  if (!current) {
+    throw {
+      code: 'TICKET_NOT_FOUND',
+      message: 'Ticket no existe',
+      statusCode: 404
+    };
+  }
+
+  // 2. Fecha/hora de marcado como NO SHOW
+  const now = new Date();
+
+  // 3. Actualizar ticket a estado NO_SHOW
+  const updated = await prisma.queueTicket.update({
+    where: { id: ticketId },
+    data: {
+      status: 'NO_SHOW',
+      noShowAt: now,
+      updatedBy: actorId || null
+    }
+  });
+
+  // 4. Respuesta limpia
+  return {
+    ticketId: updated.id,
+    status: updated.status,
+    noShowAt: updated.noShowAt
+  };
+};
+
+// queue.service.js
+
+exports.cancelTicket = async ({ ticketId, actorId }) => {
+  // 1️⃣ Verificar que el ticket exista
+  const current = await prisma.queueTicket.findUnique({
+    where: { id: ticketId },
+  });
+
+  if (!current) {
+    throw {
+      code: 'TICKET_NOT_FOUND',
+      message: 'Ticket no existe',
+      statusCode: 404,
+    };
+  }
+
+  // 2️⃣ Fecha/hora de cancelación
+  const now = new Date();
+
+  // 3️⃣ Actualizar ticket a estado CANCELLED
+  const updated = await prisma.queueTicket.update({
+    where: { id: ticketId },
+    data: {
+      status: 'CANCELLED',
+      cancelledAt: now,
+      updatedBy: actorId || null,
+    },
+  });
+
+  // 4️⃣ Respuesta limpia
+  return {
+    ticketId: updated.id,
+    status: updated.status,
+    cancelledAt: updated.cancelledAt,
+  };
+};
+
+
 /*
 exports.CancelTicket = async ({ ticketId }) => {  
 const t = await prisma.queueTicket.findUnique({ where: { id: ticketId }});

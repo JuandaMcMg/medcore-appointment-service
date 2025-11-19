@@ -135,8 +135,29 @@ async function deleteAppointment(req, res) {
   try {
     const { reason } = req.body || {};
     const actor = actorFromReq(req);
-    const appt = await apointmentService.svcCancelAppointment({ id: req.params.id, actorId: actor.id, actorRole: actor.role, reason });
-    notificationService.notifyAppointmentCancelled({ appt, authHeader: req.headers.authorization || '' });
+
+    // 🔹 Cancelar la cita
+    const appt = await apointmentService.svcCancelAppointment({
+      id: req.params.id,
+      actorId: actor.id,
+      actorRole: actor.role,
+      reason
+    });
+
+    // 🔹 Cancelar ticket en la cola si existe
+    if (appt.queueTicketId) {
+      await queueService.cancelTicket({
+        ticketId: appt.queueTicketId,
+        actorId: actor.id
+      });
+    }
+
+    // 🔹 Notificar al paciente
+    notificationService.notifyAppointmentCancelled({
+      appt,
+      authHeader: req.headers.authorization || ''
+    });
+
     return res.json({ ok: true, data: appt, message: 'Cita cancelada' });
   } catch (e) {
     if (e.status && e.code) return jsonErr(res, e.status, e.code, e.message);
