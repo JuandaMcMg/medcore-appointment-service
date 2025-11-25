@@ -1,5 +1,6 @@
 const { PrismaClient, QueueStatus } = require('../generated/prisma'); // <- ajusta la ruta si tu build genera en otro lugar
 const prisma = new PrismaClient();
+const users = require('../utils/remoteUsers');
 
 function startOfDay(d = new Date()) {
   const x = new Date(d);
@@ -60,6 +61,26 @@ async function countAhead(doctorId, createdAt) {
   return n;
 }
 
+async function enrichQueueWithContacts(queue, authHeader) {
+  const patientCache = new Map();
+
+  for (const t of queue) {
+    if (!t.patientId) continue;
+
+    if (!patientCache.has(t.patientId)) {
+      const contact = await users.getPatientContactByPatientId(
+        t.patientId,
+        authHeader
+      );
+      patientCache.set(t.patientId, contact || null);
+    }
+
+    t.patientContact = patientCache.get(t.patientId); // { fullName, email, ... } o null
+  }
+
+  return queue;
+}
+
 exports.joinQueue = async ({ actorId, doctorId, patientId, appointmentId }) => {
   const sod = startOfDay();
   const eod = endOfDay();
@@ -111,8 +132,9 @@ exports.joinQueue = async ({ actorId, doctorId, patientId, appointmentId }) => {
   };
 };
 
-exports.getDoctorCurrentQueue = async ({ doctorId }) => {
-  const sod = startOfDay(); const eod = endOfDay();
+exports.getDoctorCurrentQueue = async ({ doctorId, authHeader }) => {
+  const sod = startOfDay();
+  const eod = endOfDay();
 
   const [queue, avgMin] = await Promise.all([
     prisma.queueTicket.findMany({
@@ -123,13 +145,23 @@ exports.getDoctorCurrentQueue = async ({ doctorId }) => {
       },
       orderBy: [{ ticketNumber: 'asc' }],
       select: {
-        id: true, ticketNumber: true, status: true,
-        patientId: true, appointmentId: true,
-        createdAt: true, calledAt: true, startedAt: true, position: true, estimatedWaitTime: true
+        id: true,
+        ticketNumber: true,
+        status: true,
+        patientId: true,
+        appointmentId: true,
+        createdAt: true,
+        calledAt: true,
+        startedAt: true,
+        position: true,
+        estimatedWaitTime: true
       }
     }),
     averageServiceMinutes(doctorId)
   ]);
+
+  // 👇 Enriquecemos cada ticket con patientContact
+  await enrichQueueWithContacts(queue, authHeader);
 
   return {
     doctorId,

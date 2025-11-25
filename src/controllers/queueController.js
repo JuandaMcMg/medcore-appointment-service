@@ -27,12 +27,25 @@ async function joinQueue(req, res) {
 };
 
 // GET /queue/doctor/:doctorId/current
+// GET /queue/doctor/:doctorId/current
 async function getDoctorCurrentQueue(req, res) {
   try {
-    const r = await queueService.getDoctorCurrentQueue({ doctorId: req.params.doctorId });
+    const authHeader =
+      req.headers.authorization ||
+      req.headers.Authorization ||
+      null;
+
+    const r = await queueService.getDoctorCurrentQueue({
+      doctorId: req.params.doctorId,
+      authHeader,           // 👈 se reenvía al ms-users
+    });
+
     return ok(res, r);
-  } catch (e) { return fail(res, e); }
+  } catch (e) {
+    return fail(res, e);
+  }
 };
+
 
 // POST /queue/doctor/:doctorId/call-next
 async function callNextForDoctor(req, res) {

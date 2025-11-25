@@ -7,7 +7,7 @@ const { connectDatabase } = require('./database/database');
 const apiV1 = require('./routes/routes');
 
 const app = express();
-const PORT = process.env.PORT || 3007;
+const PORT = process.env.PORT || 3008;
 
 // ============================================
 // MIDDLEWARES
