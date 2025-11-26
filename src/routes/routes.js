@@ -5,7 +5,7 @@ const queueRoute = require("./queueRoutes")
 const scheduleRoute = require("./scheduleRoutes")
 
 
-//http://localhost:3007/api/v1/
+//http://localhost:3008/api/v1/
 
 router.use('/appointments', appointmentRoute);
 router.use('/queue', queueRoute);

@@ -44,29 +44,26 @@ async function joinQueue(req, res) {
 }
 
 
-// GET /api/v1/queue/doctor/:doctorId/current?date=2025-11-13&includeFinished=true
+// GET /queue/doctor/:doctorId/current
+// GET /queue/doctor/:doctorId/current
 async function getDoctorCurrentQueue(req, res) {
   try {
-    const { date, includeFinished } = req.query;
-
-    const day = date ? new Date(date) : new Date();
-    const includeFinishedBool =
-      String(includeFinished || '').toLowerCase() === 'true';
+    const authHeader =
+      req.headers.authorization ||
+      req.headers.Authorization ||
+      null;
 
     const r = await queueService.getDoctorCurrentQueue({
       doctorId: req.params.doctorId,
-      day,
-      includeFinished: includeFinishedBool,
+      authHeader,           // 👈 se reenvía al ms-users
     });
 
-    return res.status(200).json({ data: r });
+    return ok(res, r);
   } catch (e) {
-    console.error(e);
-    return res.status(e.statusCode || 401).json({
-      error: { code: e.code || 'SERVER_ERROR', message: e.message || 'Error' },
-    });
+    return fail(res, e);
   }
 };
+
 
 
 // POST /queue/doctor/:doctorId/call-next
