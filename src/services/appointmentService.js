@@ -1,12 +1,14 @@
 const { prisma } = require('../database/database');
 const axios = require('axios');
 const { parseISO, startOfDay, endOfDay, isValid } = require('date-fns');
-const { parseTimeToMinutes, isOverlap } = require('../utils/time');
+const { parseTimeToMinutes } = require('../utils/time');
 const users = require('../utils/remoteUsers')
 const queueService = require('../services/queue.service')
 
 const USER_URL = process.env.USER_SERVICE_URL || 'http://localhost:3003';
 const ACTIVE_STATES = ['SCHEDULED', 'CONFIRMED', 'IN_PROGRESS', 'RESCHEDULED'];
+const ALLOWED_DURATIONS = [15, 30, 45, 60];
+const CANCELLABLE_FROM = ['SCHEDULED', 'CONFIRMED', 'RESCHEDULED'];
 
 function parsePagination(page, limit) {
   const p = Math.max(1, parseInt(page || '1', 10));
@@ -18,7 +20,8 @@ const ES_TO_ENUM = {
   PROGRAMADA: 'SCHEDULED',
   CANCELADA: 'CANCELLED',
   COMPLETADA: 'COMPLETED',
-  REAGENDADA: 'RESCHEDULED'
+  REAGENDADA: 'RESCHEDULED',
+  CONFIRMADA: 'CONFIRMED'
 };
 
 const VALID_TRANSITIONS = {
@@ -43,32 +46,6 @@ function toDayRange(dateFrom, dateTo) {
   return (gte || lte) ? { gte, lte } : undefined;
 }
 
-// --- utilidades para transformar Date -> rango en minutos del día (UTC) ---
-function dayKeyUTC(date) {
-  // YYYY-MM-DD en UTC
-  return date.toISOString().slice(0, 10);
-}
-
-function minutesOfDayUTC(date) {
-  return date.getUTCHours() * 60 + date.getUTCMinutes();
-}
-
-function buildRangeFrom(date, durationMin) {
-  const startMin = minutesOfDayUTC(date);
-  const endMin = startMin + (durationMin || 0);
-  return { day: dayKeyUTC(date), startMin, endMin };
-}
-
-// --- QUERIES comunes ---
-function sameDayRange(date) {
-  // límites del día en UTC para filtrar en Mongo (almacenas Date UTC)
-  const d = new Date(date);
-  const from = startOfDay(d);
-  const to = endOfDay(d);
-  return { gte: from, lte: to };
-}
-
-
 const appErr = (message, status, code, extra = {}) => {
   const e = new Error(message);
   e.status = status;
@@ -89,7 +66,14 @@ function parseDate(d) {
   return dt;
 }
 
-// Asegura que el paciente no tenga más de 3 citas activas
+function minutesOfDayUTC(date) {
+  return date.getUTCHours() * 60 + date.getUTCMinutes();
+}
+
+function isOverlapRange(aStart, aEnd, bStart, bEnd) {
+  return aStart < bEnd && bStart < aEnd;
+}
+
 async function assertPatientActiveLimit({ patientId, excludeAppointmentId = null, tx }) {
   const client = tx || prisma;
   const count = await client.appointment.count({
@@ -99,44 +83,30 @@ async function assertPatientActiveLimit({ patientId, excludeAppointmentId = null
       ...(excludeAppointmentId ? { NOT: { id: excludeAppointmentId } } : {})
     }
   });
-  if (count >= 3) {
-      throw appErr('El paciente ya cuenta con 3 citas activas', 409, 'PATIENT_ACTIVE_LIMIT');
-    }
+  if (count >= 3) throw appErr('El paciente ya cuenta con 3 citas activas', 409, 'PATIENT_ACTIVE_LIMIT');
 }
 
-async function assertNoPatientSimultaneous({patientId, appointmentDate, duration, excludeAppointmentId = null, tx}) {
+async function assertNoPatientSimultaneous({ patientId, appointmentDate, duration, excludeAppointmentId = null, tx }) {
   const client = tx || prisma;
-
-  // Rango del mismo día (UTC)
-  const dayRange = sameDayRange(appointmentDate);
+  const dayStart = startOfDay(appointmentDate);
+  const dayEnd = endOfDay(appointmentDate);
   const startMin = minutesOfDayUTC(appointmentDate);
-  const endMin   = startMin + (duration || 0);
-
-  // Citas activas del paciente en ese día
+  const endMin = startMin + (duration || 0);
   const sameDayActives = await client.appointment.findMany({
     where: {
       patientId,
       status: { in: ACTIVE_STATES },
-      appointmentDate: { gte: dayRange.gte, lte: dayRange.lte },
+      appointmentDate: { gte: dayStart, lte: dayEnd },
       ...(excludeAppointmentId ? { NOT: { id: excludeAppointmentId } } : {})
     },
     select: { id: true, appointmentDate: true, duration: true }
   });
-
   const clash = sameDayActives.find(a => {
     const aStart = minutesOfDayUTC(new Date(a.appointmentDate));
-    const aEnd   = aStart + (a.duration || 0);
-    return isOverlap(startMin, endMin, aStart, aEnd);
+    const aEnd = aStart + (a.duration || 0);
+    return isOverlapRange(startMin, endMin, aStart, aEnd);
   });
-
-  if (clash) {
-    throw appErr(
-      'El paciente ya tiene una cita activa en esa fecha y hora',
-      409,
-      'PATIENT_OVERLAP',
-      { clashId: clash.id }
-    );
-  }
+  if (clash) throw appErr('El paciente ya tiene una cita activa en esa fecha y hora', 409, 'PATIENT_OVERLAP', { clashId: clash.id });
 }
 
 function ensureTransition(prev, next) {
@@ -161,22 +131,6 @@ async function resolvePatientIdsByName(patientName, authHeader) {
   }
 }
 
-async function getUserById(userId, authHeader) {
-  try {
-    const { data } = await axios.get(`${USER_URL}/users/${userId}`, {
-      headers: authHeader ? { Authorization: authHeader } : {}
-    });
-    const u = data?.user || data; // según tu MS de usuarios
-    return {
-      email: u?.email || null,
-      fullName: u?.fullname || `${u?.first_name || u?.firstName || ''} ${u?.last_name || u?.lastName || ''}`.trim()
-    };
-  } catch (e) {
-    console.warn('[getUserById] fallo:', e.message);
-    return null;;
-  }
-}
-
 function buildOrder(orderBy, order) {
   const field = ['appointmentDate','createdAt','status','doctorId','patientId'].includes(orderBy) ? orderBy : 'appointmentDate';
   const dir = (String(order||'asc').toLowerCase() === 'desc') ? 'desc' : 'asc';
@@ -191,14 +145,8 @@ function buildWhere({ status, doctorId, specialtyId, patientIds, patientId, date
   if (specialtyId) where.specialtyId = specialtyId;
   if (patientId) where.patientId = patientId;
   if (patientIds && patientIds.length) where.patientId = { in: patientIds };
-
-  const from = dateFrom ? dayStartUTC(dateFrom) : null;
-  const toExcl = dateTo ? nextDayStartUTC(dateTo) : null;
-  if (from || toExcl) {
-    where.appointmentDate = {};
-    if (from)   where.appointmentDate.gte = from;
-    if (toExcl) where.appointmentDate.lt  = toExcl; // límite superior exclusivo
-  }
+  const dr = toDayRange(dateFrom, dateTo);
+  if (dr) where.appointmentDate = dr;
   return where;
 }
 
@@ -309,12 +257,10 @@ async function assertDoctorHasSpecialty({ doctorId, specialtyId, authHeader }) {
 }
 
 // Crear una nueva cita
-async function svcCreateAppointment({ actorId, data, authHeader }) {
+async function svcCreateAppointment({ actorId, data }) {
   const start = parseDate(data.appointmentDate);
   const now = new Date();
-  if (start.getTime() < now.getTime()) 
-    throw appErr('No se puede programar en el pasado', 400, 'PAST_APPOINTMENT');
-  
+  if (start.getTime() < now.getTime()) throw appErr('No se puede programar en el pasado', 400, 'PAST_APPOINTMENT');
   const duration = typeof data.duration === 'number' ? data.duration : 30;
 
   //Validar existencia/estado del paciente usando el token
@@ -350,9 +296,8 @@ async function svcCreateAppointment({ actorId, data, authHeader }) {
   await assertDoctorAvailability(data.doctorId, start, duration);
   
   //Paciente: límite 3 activas y no doble booking
-  await assertPatientActiveLimit({patientId: data.patientId });
+  await assertPatientActiveLimit([data.patientId ]);
   await assertNoPatientSimultaneous({ patientId: data.patientId, appointmentDate: start, duration });
-
   const created = await prisma.$transaction(async (tx) => {
     const appt = await tx.appointment.create({
       data: {
@@ -365,9 +310,6 @@ async function svcCreateAppointment({ actorId, data, authHeader }) {
         notes: data.notes ?? null,
         status: 'SCHEDULED'
       }
-    
-    // Enviar Correo / Notificación de nueva cit  
-
     });
     await tx.appointmentHistory.create({
       data: {
@@ -458,13 +400,36 @@ async function svcListAppointments(query, authHeader) {
 }
 
 async function svcListByPatient(query, authHeader) {
-  const { patientId, status, doctorId, specialtyId, page, limit, dateFrom, dateTo, orderBy, order } = query;
-  const where = buildWhere({ status, doctorId, specialtyId, patientId, dateFrom, dateTo });
+  const {
+    patientId,
+    status,
+    doctorId,
+    specialtyId,
+    page,
+    limit,
+    dateFrom,
+    dateTo,
+    orderBy,
+    order,
+  } = query;
+
+  // 1️⃣ Construcción del filtro y orden
+  const where = buildWhere({
+    status,
+    doctorId,
+    specialtyId,
+    patientId,
+    dateFrom,
+    dateTo,
+  });
+
   const { skip, take, page: p, limit: l } = parsePagination(page, limit);
   const orderObj = buildOrder(orderBy, order);
+
+  // 2️⃣ Consultar las citas
   const [items, total] = await Promise.all([
     prisma.appointment.findMany({ where, orderBy: orderObj, skip, take }),
-    prisma.appointment.count({ where })
+    prisma.appointment.count({ where }),
   ]);
 
   await enrichAppointmentsWithContacts(items, authHeader);
@@ -524,50 +489,29 @@ async function svcListByDoctor(query, authHeader) {
   };
 }
 
-// Actualizar una cita
 async function svcUpdateAppointment({ actorId, id, data }) {
   const current = await prisma.appointment.findUnique({ where: { id } });
   if (!current) throw appErr('Cita no encontrada', 404, 'NOT_FOUND');
-
-  const duration = typeof data.duration === 'number' ? data.duration : current.duration;
-
+  if (typeof data.status !== 'undefined') throw appErr('El estado se actualiza por el endpoint de estado', 400, 'STATUS_NOT_ALLOWED_IN_UPDATE');
   let newDate;
-  if (data.appointmentDate || typeof data.duration === 'number') {
-    newDate = data.appointmentDate ? parseDate(data.appointmentDate) : new Date(current.appointmentDate);
-    
+  if (data.appointmentDate) {
+    newDate = parseDate(data.appointmentDate);
     const now = new Date();
     if (newDate.getTime() < now.getTime()) throw appErr('No se puede programar en el pasado', 400, 'PAST_APPOINTMENT');
-    
-    // Doctor libre
-    if (newDate.getTime() !== new Date(current.appointmentDate).getTime()) {
-      const dupDoctor = await prisma.appointment.findFirst({
-        where: {
-          doctorId: current.doctorId,
-          appointmentDate: newDate,
-          status: { in: ACTIVE_STATES },
-          NOT: { id }
-        },
-        select: { id: true }
-      });
-      if (dupDoctor) throw appErr('Conflicto: el nuevo horario ya está ocupado (doctor)', 409, 'OVERLAPPING_APPOINTMENT');
-    }
-
-    // Paciente: simultánea
-    await assertNoPatientSimultaneous({
-      patientId: current.patientId,
-      appointmentDate: newDate,
-      duration,
-      excludeAppointmentId: id
-    });
+  }
+  const newDuration = typeof data.duration === 'number' ? data.duration : current.duration;
+  if (!ALLOWED_DURATIONS.includes(newDuration)) throw appErr('Duración inválida. Use 15, 30, 45 o 60 minutos', 400, 'INVALID_DURATION');
+  if (newDate || (typeof data.duration === 'number')) {
+    const targetDate = newDate || new Date(current.appointmentDate);
+    await assertDoctorAvailability(current.doctorId, targetDate, newDuration);
+    await assertNoPatientSimultaneous({ patientId: current.patientId, appointmentDate: targetDate, duration: newDuration, excludeAppointmentId: id });
   }
   const updateData = {
     ...(newDate ? { appointmentDate: newDate } : {}),
-    ...(typeof data.duration === 'number' ? { duration: data.duration } : {}),
-    ...(data.status ? { status: data.status } : {}),
+    ...(typeof data.duration === 'number' ? { duration: newDuration } : {}),
     ...(typeof data.reason === 'string' ? { reason: data.reason } : {}),
     ...(typeof data.notes === 'string' ? { notes: data.notes } : {})
   };
-
   const updated = await prisma.$transaction(async (tx) => {
     const appt = await tx.appointment.update({ where: { id }, data: updateData });
     await tx.appointmentHistory.create({
@@ -591,22 +535,21 @@ async function svcUpdateAppointment({ actorId, id, data }) {
 async function svcChangeAppointmentStatus({ id, newStatusLabel, actorId, actorRole, cancellationReason }) {
   const appt = await prisma.appointment.findUnique({ where: { id } });
   if (!appt) throw appErr('Cita no encontrada', 404, 'NOT_FOUND');
-
   const next = ES_TO_ENUM[(newStatusLabel || '').toUpperCase()];
   if (!next) throw appErr('Estado inválido', 400, 'INVALID_STATUS');
-
   if (actorRole === 'PACIENTE' && ['COMPLETED','IN_PROGRESS'].includes(next)) {
     throw appErr('No autorizado para cambiar a ese estado', 403, 'FORBIDDEN');
   }
+  if (next === 'CANCELLED' && !CANCELLABLE_FROM.includes(appt.status)) {
+    throw appErr(`No se puede cancelar desde estado ${appt.status}`, 400, 'INVALID_CANCELLATION');
+  }
   ensureTransition(appt.status, next);
-  
   const updateData = { status: next };
   if (next === 'CANCELLED') {
     updateData.cancelledAt = new Date();
     if (cancellationReason) updateData.cancellationReason = cancellationReason;
     updateData.cancelledBy = actorId ?? null;
   }
-
   if (next === 'COMPLETED') updateData.completedAt = new Date();
   const updated = await prisma.$transaction(async (tx) => {
     const u = await tx.appointment.update({ where: { id }, data: updateData });
@@ -631,61 +574,47 @@ async function svcChangeAppointmentStatus({ id, newStatusLabel, actorId, actorRo
 async function svcCancelAppointment({ id, actorId, actorRole, reason }) {
   const appt = await prisma.appointment.findUnique({ where: { id } });
   if (!appt) throw appErr('Cita no encontrada', 404, 'NOT_FOUND');
-  if (['CANCELLED','COMPLETED'].includes(appt.status)) return appt;
+  if (!CANCELLABLE_FROM.includes(appt.status)) throw appErr(`No se puede cancelar desde estado ${appt.status}`, 400, 'INVALID_CANCELLATION');
   const updated = await prisma.$transaction(async (tx) => {
     const u = await tx.appointment.update({ where: { id }, data: { status: 'CANCELLED', cancelledAt: new Date(), cancellationReason: reason || 'Cancelled via DELETE', cancelledBy: actorId ?? null } });
     await tx.appointmentHistory.create({ data: { appointmentId: u.id, action: 'CANCELLED', previousStatus: appt.status, newStatus: 'CANCELLED', previousData: { status: appt.status }, newData: { status: 'CANCELLED', cancellationReason: reason || null }, changedFields: ['status','cancelledAt','cancellationReason','cancelledBy'], changedBy: actorId ?? null, changedByRole: actorRole || 'SYSTEM' } });
     return u;
   });
+  
   return updated;
-} 
-function dayStartUTC(dateStr) {
-  // dateStr: "YYYY-MM-DD"
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateStr || '').trim());
-  if (!m) return null;
-  const [ , y, mo, d ] = m.map(Number);
-  return new Date(Date.UTC(y, mo, d, 0, 0, 0, 0)); // mo ya es 2 dígitos, pero Number lo vuelve int
 }
 
-function dayStartUTC(dateStr) {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateStr||'').trim());
-  if (!m) return null;
-  const y = Number(m[1]), mo = Number(m[2]) - 1, d = Number(m[3]);
-  return new Date(Date.UTC(y, mo, d, 0, 0, 0, 0));
-}
-function nextDayStartUTC(dateStr) {
-  const s = dayStartUTC(dateStr);
+function safeDayStart(s) {
   if (!s) return null;
-  return new Date(Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), s.getUTCDate() + 1, 0, 0, 0, 0));
+  const d = parseISO(s.length > 10 ? s : `${s}T00:00:00.000Z`);
+  if (!isValid(d)) return null;
+  return startOfDay(d);
+}
+function safeDayEnd(s) {
+  if (!s) return null;
+  const d = parseISO(s.length > 10 ? s : `${s}T00:00:00.000Z`);
+  if (!isValid(d)) return null;
+  return endOfDay(d);
 }
 
 async function svcListByDateRange({ dateFrom, dateTo, doctorId, patientId, status }) {
   const where = {};
-  const from = dateFrom ? dayStartUTC(dateFrom) : null;        // >= 2025-12-17T00:00:00Z
-  const toExcl = dateTo ? nextDayStartUTC(dateTo) : null;      //  < 2025-12-21T00:00:00Z
-
-  if (from || toExcl) {
+  const from = safeDayStart(dateFrom);
+  const to = safeDayEnd(dateTo);
+  if (from || to) {
     where.appointmentDate = {};
-    if (from)  where.appointmentDate.gte = from;
-    if (toExcl) where.appointmentDate.lt  = toExcl; // límite superior EXCLUSIVO
+    if (from) where.appointmentDate.gte = from;
+    if (to) where.appointmentDate.lte = to;
   }
-
-  if (doctorId)  where.doctorId = doctorId;
+  if (doctorId) where.doctorId = doctorId;
   if (patientId) where.patientId = patientId;
   if (status) {
     const mapped = ES_TO_ENUM[String(status).toUpperCase()] || String(status).toUpperCase();
     where.status = mapped;
   }
-
   const list = await prisma.appointment.findMany({ where, orderBy: { appointmentDate: 'asc' } });
-  return {
-    ok: true,
-    data: list,
-    pagination: { total: list.length, pages: 1, page: 1, limit: 20 },
-    filters: { doctorId, dateFrom, dateTo, orderBy: 'appointmentDate', order: 'asc' }
-  };
+  return { filters: { dateFrom, dateTo, doctorId, patientId, status }, total: list.length, items: list };
 }
-
 
 module.exports = {
   svcListAppointments,
@@ -697,5 +626,4 @@ module.exports = {
   svcChangeAppointmentStatus,
   svcCancelAppointment,
   svcListByDateRange,
-  getUserById
 };
