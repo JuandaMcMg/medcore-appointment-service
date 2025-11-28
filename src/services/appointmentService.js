@@ -257,7 +257,7 @@ async function assertDoctorHasSpecialty({ doctorId, specialtyId, authHeader }) {
 }
 
 // Crear una nueva cita
-async function svcCreateAppointment({ actorId, data }) {
+async function svcCreateAppointment({ actorId,authHeader, data }) {
   const start = parseDate(data.appointmentDate);
   const now = new Date();
   if (start.getTime() < now.getTime()) throw appErr('No se puede programar en el pasado', 400, 'PAST_APPOINTMENT');
@@ -296,7 +296,7 @@ async function svcCreateAppointment({ actorId, data }) {
   await assertDoctorAvailability(data.doctorId, start, duration);
   
   //Paciente: límite 3 activas y no doble booking
-  await assertPatientActiveLimit([data.patientId ]);
+  await assertPatientActiveLimit({patientId: data.patientId});
   await assertNoPatientSimultaneous({ patientId: data.patientId, appointmentDate: start, duration });
   const created = await prisma.$transaction(async (tx) => {
     const appt = await tx.appointment.create({
@@ -326,22 +326,6 @@ async function svcCreateAppointment({ actorId, data }) {
     });
     return appt;
   });
-  //Asignamos un turno en la cola luego de crear la cita
-  try {
-    await queueService.joinQueue({
-      actorId: actorId || null,
-      doctorId: created.doctorId,
-      patientId: created.patientId,
-      appointmentId: created.id
-    });
-  } catch (err) {
-    console.warn(
-      '[svcCreateAppointment] fallo al asignar turno en la cola:',
-      err?.message || err
-    );
-    // NO lanzamos error para no romper la creación de la cita
-  }
-
   return created;
 }
 

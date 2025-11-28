@@ -403,8 +403,6 @@ exports.markNoShow = async ({ ticketId, actorId }) => {
   };
 };
 
-// queue.service.js
-
 exports.cancelTicket = async ({ ticketId, actorId }) => {
   // 1️⃣ Verificar que el ticket exista
   const current = await prisma.queueTicket.findUnique({
