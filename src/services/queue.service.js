@@ -1,5 +1,6 @@
 const { PrismaClient, QueueStatus } = require('../generated/prisma'); // <- ajusta la ruta si tu build genera en otro lugar
 const prisma = new PrismaClient();
+const users = require('../utils/remoteUsers');
 
 function startOfDay(d = new Date()) {
   const x = new Date(d);
@@ -60,22 +61,25 @@ async function countAhead(doctorId, createdAt) {
   return n;
 }
 
-/* Asegura que el Doctor no tenga más de 10 turnos y no este completado
-async function queuedoctorLimit({ doctorId }) {
-  const count = await prisma.queueTicket.count({
-	where: {
-		doctorId,
-		status: { in: ['WAITING', 'CALLED', 'IN_PROGRESS'] }
-	}
-  });
-  console.log(`El doctor tiene ${count} pacientes en la cola de espera`);
-  if (count >= 5 ) {
-	  const error = new Error(
-      error.statusCode=429,
-      message='Cola llena: El doctor ya tiene el número máximo de pacientes en espera');
-    throw error;
-	}
-}*/
+async function enrichQueueWithContacts(queue, authHeader) {
+  const patientCache = new Map();
+
+  for (const t of queue) {
+    if (!t.patientId) continue;
+
+    if (!patientCache.has(t.patientId)) {
+      const contact = await users.getPatientContactByPatientId(
+        t.patientId,
+        authHeader
+      );
+      patientCache.set(t.patientId, contact || null);
+    }
+
+    t.patientContact = patientCache.get(t.patientId); // { fullName, email, ... } o null
+  }
+
+  return queue;
+}
 
 exports.joinQueue = async ({ actorId, doctorId, patientId, appointmentId }) => {
   const sod = startOfDay();
@@ -168,24 +172,17 @@ exports.joinQueue = async ({ actorId, doctorId, patientId, appointmentId }) => {
   };
 };
 
-exports.getDoctorCurrentQueue = async ({ doctorId, day = new Date(), includeFinished = false }) => {
-  const sod = startOfDay(day);
-  const eod = endOfDay(day);
+exports.getDoctorCurrentQueue = async ({ doctorId, authHeader }) => {
+  const sod = startOfDay();
+  const eod = endOfDay();
 
-
-  const where = {
-    doctorId,
-    queueDate: { gte: sod, lte: eod },
-  };
-
-  // Por defecto solo la cola “activa”
-  if (!includeFinished) {
-    where.status = { in: ['WAITING', 'CALLED', 'IN_PROGRESS'] };
-  }
-
-  const [tickets, avgMin] = await Promise.all([
+  const [queue, avgMin] = await Promise.all([
     prisma.queueTicket.findMany({
-      where,
+      where: {
+        doctorId,
+        queueDate: { gte: sod, lte: eod },
+        status: { in: ['WAITING', 'CALLED', 'IN_PROGRESS'] }
+      },
       orderBy: [{ ticketNumber: 'asc' }],
       select: {
         id: true,
@@ -193,53 +190,21 @@ exports.getDoctorCurrentQueue = async ({ doctorId, day = new Date(), includeFini
         status: true,
         patientId: true,
         appointmentId: true,
-        queueDate: true,
         createdAt: true,
         calledAt: true,
         startedAt: true,
-        completedAt: true,
         position: true,
-        estimatedWaitTime: true,
+        estimatedWaitTime: true
       }
     }),
     averageServiceMinutes(doctorId)
   ]);
 
-  const now = new Date();
-
-  // calcular cuánto tiempo ha esperado cada ticket
-  const queue = tickets.map((t) => {
-    const base = t.queueDate || t.createdAt; // cuándo entró a la cola
-
-    let endRef = now;
-    if (t.status === 'WAITING') {
-      endRef = now;                       // sigue esperando
-    } else if (t.status === 'CALLED') {
-      endRef = t.calledAt || now;         // espera hasta que lo llamaron
-    } else if (t.status === 'IN_PROGRESS') {
-      endRef = t.startedAt || now;        // espera hasta que empezó la atención
-    } else {
-      // COMPLETED / CANCELLED / NO_SHOW: esperamos hasta que salió del flujo
-      endRef = t.startedAt || t.calledAt || t.completedAt || now;
-    }
-
-    let waitingMinutes = null;
-    if (base) {
-      waitingMinutes = Math.max(
-        0,
-        Math.round((endRef.getTime() - base.getTime()) / (1000 * 60))
-      );
-    }
-
-    return {
-      ...t,
-      waitingMinutes, //tiempo que ha esperado esa persona
-    };
-  });
+  // 👇 Enriquecemos cada ticket con patientContact
+  await enrichQueueWithContacts(queue, authHeader);
 
   return {
     doctorId,
-    date: sod,
     averageServiceMinutes: avgMin,
     size: queue.length,
     queue
@@ -437,8 +402,6 @@ exports.markNoShow = async ({ ticketId, actorId }) => {
     noShowAt: updated.noShowAt
   };
 };
-
-// queue.service.js
 
 exports.cancelTicket = async ({ ticketId, actorId }) => {
   // 1️⃣ Verificar que el ticket exista
