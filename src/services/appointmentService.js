@@ -83,7 +83,7 @@ async function assertPatientActiveLimit({ patientId, excludeAppointmentId = null
       ...(excludeAppointmentId ? { NOT: { id: excludeAppointmentId } } : {})
     }
   });
-  if (count >= 3) throw appErr('El paciente ya cuenta con 3 citas activas', 409, 'PATIENT_ACTIVE_LIMIT');
+  if (count >= 20) throw appErr('El paciente ya cuenta con 3 citas activas', 409, 'PATIENT_ACTIVE_LIMIT');
 }
 
 async function assertNoPatientSimultaneous({ patientId, appointmentDate, duration, excludeAppointmentId = null, tx }) {

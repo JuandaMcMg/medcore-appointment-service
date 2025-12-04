@@ -10,7 +10,7 @@ router.use(verifyToken);
 router.post('/:patientId', authorizeRoles('ADMINISTRADOR','PACIENTE'), appointmentController.createAppointment); 
 
 // Obtener cita por ID
-// GET http://localhost:3007/api/v1/appointments/by-id/:id
+// GET http://localhost:3008/api/v1/appointments/by-id/:id
 router.get('/by-id/:id', authorizeRoles('ADMINISTRADOR', 'PACIENTE', 'MEDICO'), appointmentController.getAppointmentById);
 
 // Actualizar cita (fecha/hora/estado/reason/notes/duration)

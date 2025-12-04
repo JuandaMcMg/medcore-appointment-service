@@ -476,7 +476,6 @@ exports.cancelTicket = async ({ ticketId, actorId }) => {
 };
 
 
-/*
 exports.CancelTicket = async ({ ticketId }) => {  
 const t = await prisma.queueTicket.findUnique({ where: { id: ticketId }});
   if (!t) throw { code: 'TICKET_NOT_FOUND', message: 'Ticket no existe', statusCode: 404 };
@@ -486,24 +485,5 @@ const t = await prisma.queueTicket.findUnique({ where: { id: ticketId }});
     data: { status: 'CANCELLED', completedAt: new Date() }
   }); 
 
-  // Ajustar posiciones del resto (una persona menos delante)
-  const sod = startOfDay(); const eod = endOfDay();
-  const avgMin = await averageServiceMinutes(done.doctorId);
-
-  const waiting = await prisma.queueTicket.findMany({
-    where: {
-      doctorId: done.doctorId,
-      queueDate: { gte: sod, lte: eod },
-      status: { in: ['WAITING'] }
-    },
-    orderBy: [{ ticketNumber: 'asc' }]
-  });
-
-  await Promise.all(waiting.map((t, idx) =>
-    prisma.queueTicket.update({
-      where: { id: t.id },
-      data: { position: idx + 1, estimatedWaitTime: idx * avgMin }
-    })
-  ));
   return { ticketId: canceled.id, status: canceled.status, completedAt: canceled.completedAt };
-};*/
+};

@@ -13,7 +13,7 @@ router.post('/join', authorizeRoles("ADMINISTRADOR","PACIENTE", "MEDICO"), queue
 //Ver la cola de espera del médico
 router.get('/doctor/:doctorId/current', authorizeRoles('ADMINISTRADOR', 'MEDICO'), queueController.getDoctorCurrentQueue);
 
-// GET http://localhost:3007/api/v1/queue/doctor/:doctorId/call-next
+// GET http://localhost:3008/api/v1/queue/doctor/:doctorId/call-next
 //Llamar al siguiente paciente en la cola de espera del médico
 router.post('/doctor/:doctorId/call-next', authorizeRoles('ADMINISTRADOR', 'MEDICO'), queueController.callNextForDoctor);
 
@@ -41,6 +41,7 @@ router.put('/ticket/:ticketId/complete', authorizeRoles('ADMINISTRADOR', 'MEDICO
 //Ver posición en la cola de espera
 router.get('/ticket/:ticketId/position', authorizeRoles('ADMINISTRADOR', 'MEDICO',"PACIENTE"), queueController.getTicketPosition);
 
-//router.delete('/ticket/:ticketId/cancel', authorizeRoles('ADMINISTRADOR', 'PACIENTE', 'MEDICO'), queueController.cancelTicket);
+//DELETE http://localhost:3007/api/v1/queue/ticket/:ticketId/cancel
+router.delete('/ticket/:ticketId/cancel', authorizeRoles('ADMINISTRADOR', 'PACIENTE', 'MEDICO'), queueController.cancelTicket);
 
 module.exports = router;

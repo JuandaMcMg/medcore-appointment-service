@@ -94,12 +94,12 @@ async function getTicketPosition(req, res) {
 };
 
 
-/*async function cancelTicket(req, res) {
+async function cancelTicket(req, res) {
   try {
     const r = await queueService.CancelTicket({ ticketId: req.params.ticketId });
     return ok(res, r);
   } catch (e) { return fail(res, e); }
-};*/
+};
 
 //+++
 // PUT /queue/ticket/:ticketId/call
@@ -107,7 +107,6 @@ async function callTicket(req, res) {
   try {
     const r = await queueService.callTicket({
       ticketId: req.params.ticketId,
-      actorId: req.user?.id
     });
 
     return ok(res, r);
@@ -164,7 +163,7 @@ module.exports = {
     callNextForDoctor,
     completeTicket,
     getTicketPosition,
-    // cancelTicket
+    cancelTicket,
     startTicket,
     callTicket,
     exitQueue,
