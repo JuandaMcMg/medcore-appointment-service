@@ -1,0 +1,207 @@
+openapi: 3.0.0
+info:
+  title: MedCore - Queue / Clinical Workflow
+  version: 1.0.0
+  description: Endpoints de flujo clínico del doctor (Sprint 5) para el servicio de colas / citas.
+servers:
+  - url: http://localhost:3008/api/v1/queue
+    description: Servidor local de Queue
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    QueueTicket:
+      type: object
+      properties:
+        id:
+          type: string
+        ticketNumber:
+          type: integer
+        status:
+          type: string
+          description: Estado del ticket (IN_PROGRESS, CALLED, etc.)
+        position:
+          type: integer
+          nullable: true
+        estimatedWaitTime:
+          type: integer
+          nullable: true
+          description: Tiempo de espera estimado en minutos
+
+    Appointment:
+      type: object
+      description: Cita médica básica
+      properties:
+        id:
+          type: string
+        patientId:
+          type: string
+        doctorId:
+          type: string
+        status:
+          type: string
+        appointmentDate:
+          type: string
+          format: date-time
+        reason:
+          type: string
+          nullable: true
+
+    PatientContact:
+      type: object
+      description: Información básica de contacto del paciente
+      additionalProperties: true
+
+    MedicalRecord:
+      type: object
+      description: Historia clínica asociada a la cita (si existe)
+      additionalProperties: true
+
+paths:
+  /doctor/{doctorId}/current:
+    get:
+      summary: Obtener el paciente que está siendo atendido actualmente por el doctor
+      description: >
+        Devuelve el ticket en IN_PROGRESS o CALLED de hoy para el doctor
+        junto con la cita, el contacto del paciente y la historia clínica si ya existe.
+      tags:
+        - Clinical Workflow
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: doctorId
+          required: true
+          schema:
+            type: string
+          description: ID del médico
+      responses:
+        '200':
+          description: Información del paciente actualmente en atención
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  doctorId:
+                    type: string
+                  ticket:
+                    $ref: '#/components/schemas/QueueTicket'
+                  appointment:
+                    allOf:
+                      - $ref: '#/components/schemas/Appointment'
+                      - nullable: true
+                  patient:
+                    allOf:
+                      - $ref: '#/components/schemas/PatientContact'
+                      - nullable: true
+                  medicalRecord:
+                    allOf:
+                      - $ref: '#/components/schemas/MedicalRecord'
+                      - nullable: true
+        '404':
+          description: No hay paciente en atención actualmente
+        '500':
+          description: Error obteniendo paciente actual
+
+  /doctor/{doctorId}/confirmed:
+    get:
+      summary: Listar citas confirmadas del doctor
+      description: Lista las citas con estado CONFIRMED desde una fecha inicial (por defecto hoy) y opcionalmente hasta una fecha final.
+      tags:
+        - Clinical Workflow
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: doctorId
+          required: true
+          schema:
+            type: string
+          description: ID del médico
+        - in: query
+          name: dateFrom
+          required: false
+          schema:
+            type: string
+            format: date
+          description: Fecha inicial (YYYY-MM-DD). Por defecto la fecha actual.
+        - in: query
+          name: dateTo
+          required: false
+          schema:
+            type: string
+            format: date
+          description: Fecha final (YYYY-MM-DD). Si no se envía, se listan desde dateFrom en adelante.
+      responses:
+        '200':
+          description: Lista de citas confirmadas del doctor
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  doctorId:
+                    type: string
+                  total:
+                    type: integer
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Appointment'
+        '500':
+          description: Error listando citas confirmadas
+
+  /doctor/{doctorId}/history:
+    get:
+      summary: Historial de pacientes atendidos por el doctor
+      description: >
+        Devuelve el historial paginado de historias clínicas asociadas al médico,
+        consultando internamente al microservicio de historias.
+      tags:
+        - Clinical Workflow
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: doctorId
+          required: true
+          schema:
+            type: string
+          description: ID del médico
+        - in: query
+          name: page
+          required: false
+          schema:
+            type: integer
+            default: 1
+          description: Número de página
+        - in: query
+          name: limit
+          required: false
+          schema:
+            type: integer
+            default: 20
+          description: Tamaño de página
+      responses:
+        '200':
+          description: Historial del doctor (estructura devuelta por el MS de historias)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  doctorId:
+                    type: string
+                  # El resto de campos depende del MS de historias (page, total, items, etc.)
+                  data:
+                    type: object
+                    description: Respuesta original del microservicio de historias
+                    additionalProperties: true
+        '500':
+          description: Error obteniendo historial del doctor

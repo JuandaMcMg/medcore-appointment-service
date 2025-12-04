@@ -5,9 +5,20 @@ const cors = require('cors');
 const helmet = require('helmet');
 const { connectDatabase } = require('./database/database');
 const apiV1 = require('./routes/routes');
+const swaggerUi = require('swagger-ui-express');
+const YAML =require('yamljs');
+const path = require("path");
 
 const app = express();
 const PORT = process.env.PORT || 3008;
+
+// Cargar el YAML
+const queueClinicalDoc = YAML.load(
+  path.join(__dirname, "swagger", "swaggerQueue.yml")
+);
+
+// Montar la documentación SOLO de este MS y SOLO de estos endpoints
+app.use("/api-docs/queue", swaggerUi.serve, swaggerUi.setup(queueClinicalDoc));
 
 // ============================================
 // MIDDLEWARES
